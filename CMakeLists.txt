@@ -18,6 +18,7 @@ set(SOURCES
 # Header files
 set(HEADERS
     src/Application.h
+    src/Shaders.h
 )
 
 # Create executable
