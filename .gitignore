@@ -31,4 +31,16 @@ compile_commands.json
 
 # OS files
 .DS_Store
+
+# Cloned assets (fetched via fetch_bistro_assets script)
+Assets/
+
+# Editor/tool caches
+.cache/
+
+# Slang compiler binaries (downloaded, not source)
+tools/
+
+# Compiled SPIR-V shaders (generated from .slang sources)
+shaders/*.spv
 Thumbs.db
