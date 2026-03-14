@@ -97,10 +97,48 @@ if(SLANGC_EXECUTABLE)
     # Ensure the output directory for compiled shaders exists
     file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 
-    # Compile Slang shaders using slangc
+    # Shaders with multiple same-stage entry points must be compiled per-entry so
+    # each resulting SPIR-V has exactly one unambiguous "main" entry point.
+    # (Having two Fragment entry points both named "main" in one module is invalid SPIR-V.)
+
+    # physics.slang — 4 compute entry points
+    set(PHYSICS_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/physics.slang)
+    set(PHYSICS_ENTRIES IntegrateCS BroadPhaseCS NarrowPhaseCS ResolveCS)
+    foreach(ENTRY ${PHYSICS_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(PHYSICS_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/physics_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${PHYSICS_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${PHYSICS_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${PHYSICS_SPV}
+            DEPENDS ${PHYSICS_SHADER}
+            COMMENT "Compiling physics.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${PHYSICS_SPV})
+    endforeach()
+
+    # pbr.slang — VSMain (vertex) + PSMain (fragment) + GlassPSMain (fragment)
+    # Two Fragment entry points cannot share a name in one module.
+    set(PBR_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/pbr.slang)
+    set(PBR_ENTRIES VSMain PSMain GlassPSMain)
+    foreach(ENTRY ${PBR_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(PBR_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/pbr_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${PBR_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${PBR_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${PBR_SPV}
+            DEPENDS ${PBR_SHADER}
+            COMMENT "Compiling pbr.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${PBR_SPV})
+    endforeach()
+
+    # Compile all other Slang shaders (skip per-entry shaders handled above)
     foreach(SHADER ${SLANG_SHADER_SOURCES})
         get_filename_component(SHADER_NAME ${SHADER} NAME)
         get_filename_component(SHADER_NAME_WE ${SHADER_NAME} NAME_WE)
+        if(SHADER_NAME_WE STREQUAL "physics" OR SHADER_NAME_WE STREQUAL "pbr")
+            continue()
+        endif()
         string(REGEX REPLACE "\.slang$" "" OUTPUT_NAME ${SHADER_NAME})
         add_custom_command(
             OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/shaders/${OUTPUT_NAME}.spv
@@ -251,7 +289,7 @@ endif()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/models)
     if (NOT ANDROID)
     add_custom_command(TARGET SimpleEngine POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/models ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/models
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/models ${CMAKE_CURRENT_BINARY_DIR}/models
         COMMENT "Copying models to output directory"
     )
 endif()
@@ -260,7 +298,7 @@ endif ()
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/textures)
     if (NOT ANDROID)
     add_custom_command(TARGET SimpleEngine POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/textures ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/textures
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_SOURCE_DIR}/textures ${CMAKE_CURRENT_BINARY_DIR}/textures
         COMMENT "Copying textures to output directory"
     )
 endif()

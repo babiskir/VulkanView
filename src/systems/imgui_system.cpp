@@ -883,12 +883,12 @@ bool ImGuiSystem::createPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo;
     vertShaderStageInfo.stage = vk::ShaderStageFlagBits::eVertex;
     vertShaderStageInfo.module = *shaderModule;
-    vertShaderStageInfo.pName = "VSMain";
+    vertShaderStageInfo.pName = "main";
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo;
     fragShaderStageInfo.stage = vk::ShaderStageFlagBits::eFragment;
     fragShaderStageInfo.module = *shaderModule;
-    fragShaderStageInfo.pName = "PSMain";
+    fragShaderStageInfo.pName = "main";
 
     std::array shaderStages = {vertShaderStageInfo, fragShaderStageInfo};
 

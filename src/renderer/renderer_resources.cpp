@@ -3334,18 +3334,47 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
         }
 
         // Process remaining non-memory jobs individually
+        // Reserve 512 MB for critical render resources (depth, scene color, swapchain, etc.)
+        // Use `used` (actually consumed bytes) rather than `allocated` (block capacity) so we
+        // don't over-estimate and stop streaming too early.
+        constexpr vk::DeviceSize kVRAMReserveBytes = 512ull * 1024 * 1024;
+        // Cache device VRAM total once per batch to avoid repeated driver queries.
+        vk::DeviceSize deviceLocalTotal = 0;
+        if (memoryPool) {
+          const auto memProps = physicalDevice.getMemoryProperties();
+          for (uint32_t i = 0; i < memProps.memoryHeapCount; ++i) {
+            if (memProps.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+              deviceLocalTotal += memProps.memoryHeaps[i].size;
+              break;
+            }
+          }
+        }
         for (auto& job : batch) {
+          const bool isCritical = (job.priority == PendingTextureJob::Priority::Critical);
+          if (!isCritical && memoryPool && deviceLocalTotal > 0) {
+            auto [used, allocated] = memoryPool->getTotalMemoryUsage();
+            // Use `allocated` (total block capacity committed to the driver) as the
+            // budget signal — it reflects actual device memory pressure, not just
+            // the bytes currently occupied within those blocks.
+            if (allocated + kVRAMReserveBytes > deviceLocalTotal) {
+              // VRAM nearly full — skip this non-critical texture to preserve budget
+              std::cerr << "UploadsWorker: VRAM budget reached, skipping '" << job.idOrPath << "'" << std::endl;
+              uploadJobsCompleted.fetch_add(1, std::memory_order_relaxed);
+              continue;
+            }
+          }
           try {
             if (job.type == PendingTextureJob::Type::FromFile) {
               (void) LoadTexture(job.idOrPath);
               OnTextureUploaded(job.idOrPath);
-              if (job.priority == PendingTextureJob::Priority::Critical) {
+              if (isCritical) {
                 criticalJobsOutstanding.fetch_sub(1, std::memory_order_relaxed);
               }
               uploadJobsCompleted.fetch_add(1, std::memory_order_relaxed);
             }
           } catch (const std::exception& e) {
             std::cerr << "UploadsWorker: failed to process job for '" << job.idOrPath << "': " << e.what() << std::endl;
+            uploadJobsCompleted.fetch_add(1, std::memory_order_relaxed);
           }
         }
       }

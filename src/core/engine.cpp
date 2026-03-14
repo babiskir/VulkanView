@@ -450,11 +450,11 @@ void Engine::handleKeyInput(uint32_t key, bool pressed) {
     case GLFW_KEY_RIGHT:
       cameraControl.moveRight = pressed;
       break;
-    case GLFW_KEY_Q:
+    case GLFW_KEY_E:
     case GLFW_KEY_PAGE_UP:
       cameraControl.moveUp = pressed;
       break;
-    case GLFW_KEY_E:
+    case GLFW_KEY_Q:
     case GLFW_KEY_PAGE_DOWN:
       cameraControl.moveDown = pressed;
       break;

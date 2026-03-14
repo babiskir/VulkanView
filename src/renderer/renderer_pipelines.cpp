@@ -50,7 +50,7 @@ bool Renderer::createDescriptorSetLayout() {
     vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
     std::array<vk::DescriptorBindingFlags, 2> bindingFlags{};
     if (descriptorIndexingEnabled) {
-      bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+      bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[1] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
       bindingFlagsInfo.pBindingFlags = bindingFlags.data();
@@ -196,7 +196,7 @@ bool Renderer::createPBRDescriptorSetLayout() {
     vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
     std::array<vk::DescriptorBindingFlags, 14> bindingFlags{};
     if (descriptorIndexingEnabled) {
-      bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+      bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[1] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[10] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
@@ -255,20 +255,20 @@ bool Renderer::createGraphicsPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *shaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *shaderModule,
-      .pName = "PSMain"
+      .pName = "main"
     };
 
     // Fragment entry point specialized for architectural glass
     vk::PipelineShaderStageCreateInfo fragGlassStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *shaderModule,
-      .pName = "GlassPSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
@@ -426,30 +426,29 @@ bool Renderer::createPBRPipeline() {
       return false;
     }
 
-    // Read shader code
-    auto shaderCode = readFile("shaders/pbr.spv");
+    // Each PBR entry point is compiled to its own SPV to avoid two Fragment
+    // entry points sharing the name "main" in one module (invalid SPIR-V).
+    vk::raii::ShaderModule vertShaderModule  = createShaderModule(readFile("shaders/pbr_vsmain.spv"));
+    vk::raii::ShaderModule fragShaderModule  = createShaderModule(readFile("shaders/pbr_psmain.spv"));
+    vk::raii::ShaderModule glassShaderModule = createShaderModule(readFile("shaders/pbr_glasspsmain.spv"));
 
-    // Create shader modules
-    vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode);
-
-    // Create shader stage info
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
-      .module = *shaderModule,
-      .pName = "VSMain"
+      .module = *vertShaderModule,
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
-      .module = *shaderModule,
-      .pName = "PSMain"
+      .module = *fragShaderModule,
+      .pName = "main"
     };
 
     // Fragment entry point specialized for architectural glass
     vk::PipelineShaderStageCreateInfo fragGlassStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
-      .module = *shaderModule,
-      .pName = "GlassPSMain"
+      .module = *glassShaderModule,
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
@@ -769,12 +768,12 @@ bool Renderer::createCompositePipeline() {
     vk::PipelineShaderStageCreateInfo vert{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *shaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
     vk::PipelineShaderStageCreateInfo frag{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *shaderModule,
-      .pName = "PSMain"
+      .pName = "main"
     };
     vk::PipelineShaderStageCreateInfo stages[] = {vert, frag};
 
@@ -855,7 +854,7 @@ bool Renderer::createDepthPrepassPipeline() {
     vk::PipelineShaderStageCreateInfo vertStage{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *shaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     // Vertex/instance bindings & attributes same as PBR
@@ -970,13 +969,13 @@ bool Renderer::createLightingPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *shaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *shaderModule,
-      .pName = "PSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};

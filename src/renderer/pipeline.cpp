@@ -152,13 +152,13 @@ bool Pipeline::createGraphicsPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *vertShaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *fragShaderModule,
-      .pName = "PSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
@@ -325,13 +325,13 @@ bool Pipeline::createPBRPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *vertShaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *fragShaderModule,
-      .pName = "PSMain" // Changed from FSMain to PSMain to match the shader
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};
@@ -518,13 +518,13 @@ bool Pipeline::createLightingPipeline() {
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *vertShaderModule,
-      .pName = "VSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo fragShaderStageInfo{
       .stage = vk::ShaderStageFlagBits::eFragment,
       .module = *fragShaderModule,
-      .pName = "PSMain"
+      .pName = "main"
     };
 
     vk::PipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo, fragShaderStageInfo};

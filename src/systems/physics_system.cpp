@@ -658,12 +658,11 @@ bool PhysicsSystem::InitializeVulkanResources() {
     // Create shader modules
     const vk::raii::Device& raiiDevice = renderer->GetRaiiDevice();
 
-    // Load physics shader once and reuse for all compute pipelines
-    std::vector<char> physicsShaderCode = readFile("shaders/physics.spv");
-    vulkanResources.integrateShaderModule = createShaderModule(raiiDevice, physicsShaderCode);
-    vulkanResources.broadPhaseShaderModule = createShaderModule(raiiDevice, physicsShaderCode);
-    vulkanResources.narrowPhaseShaderModule = createShaderModule(raiiDevice, physicsShaderCode);
-    vulkanResources.resolveShaderModule = createShaderModule(raiiDevice, physicsShaderCode);
+    // Load per-entry-point physics shaders (each compiled separately so entry point is unambiguous)
+    vulkanResources.integrateShaderModule   = createShaderModule(raiiDevice, readFile("shaders/physics_integratecs.spv"));
+    vulkanResources.broadPhaseShaderModule  = createShaderModule(raiiDevice, readFile("shaders/physics_broadphasecs.spv"));
+    vulkanResources.narrowPhaseShaderModule = createShaderModule(raiiDevice, readFile("shaders/physics_narrowphasecs.spv"));
+    vulkanResources.resolveShaderModule     = createShaderModule(raiiDevice, readFile("shaders/physics_resolvecs.spv"));
 
     // Create a descriptor set layout
     std::array<vk::DescriptorSetLayoutBinding, 5> bindings = {
@@ -750,7 +749,7 @@ bool PhysicsSystem::InitializeVulkanResources() {
     vk::PipelineShaderStageCreateInfo integrateStageInfo;
     integrateStageInfo.stage = vk::ShaderStageFlagBits::eCompute;
     integrateStageInfo.module = *vulkanResources.integrateShaderModule;
-    integrateStageInfo.pName = "IntegrateCS";
+    integrateStageInfo.pName = "main";
     pipelineInfo.stage = integrateStageInfo;
     vulkanResources.integratePipeline = vk::raii::Pipeline(raiiDevice, nullptr, pipelineInfo);
 
@@ -758,7 +757,7 @@ bool PhysicsSystem::InitializeVulkanResources() {
     vk::PipelineShaderStageCreateInfo broadPhaseStageInfo;
     broadPhaseStageInfo.stage = vk::ShaderStageFlagBits::eCompute;
     broadPhaseStageInfo.module = *vulkanResources.broadPhaseShaderModule;
-    broadPhaseStageInfo.pName = "BroadPhaseCS";
+    broadPhaseStageInfo.pName = "main";
     pipelineInfo.stage = broadPhaseStageInfo;
     vulkanResources.broadPhasePipeline = vk::raii::Pipeline(raiiDevice, nullptr, pipelineInfo);
 
@@ -766,7 +765,7 @@ bool PhysicsSystem::InitializeVulkanResources() {
     vk::PipelineShaderStageCreateInfo narrowPhaseStageInfo;
     narrowPhaseStageInfo.stage = vk::ShaderStageFlagBits::eCompute;
     narrowPhaseStageInfo.module = *vulkanResources.narrowPhaseShaderModule;
-    narrowPhaseStageInfo.pName = "NarrowPhaseCS";
+    narrowPhaseStageInfo.pName = "main";
     pipelineInfo.stage = narrowPhaseStageInfo;
     vulkanResources.narrowPhasePipeline = vk::raii::Pipeline(raiiDevice, nullptr, pipelineInfo);
 
@@ -774,7 +773,7 @@ bool PhysicsSystem::InitializeVulkanResources() {
     vk::PipelineShaderStageCreateInfo resolveStageInfo;
     resolveStageInfo.stage = vk::ShaderStageFlagBits::eCompute;
     resolveStageInfo.module = *vulkanResources.resolveShaderModule;
-    resolveStageInfo.pName = "ResolveCS";
+    resolveStageInfo.pName = "main";
     pipelineInfo.stage = resolveStageInfo;
     vulkanResources.resolvePipeline = vk::raii::Pipeline(raiiDevice, nullptr, pipelineInfo);
 

@@ -719,7 +719,9 @@ void Renderer::recreateSwapChain() {
   createSwapChain();
   createImageViews();
   setupDynamicRendering();
-  createDepthResources();
+  if (!createDepthResources()) {
+    throw std::runtime_error("recreateSwapChain: failed to create depth resources (out of device memory?)");
+  }
 
   // (Re)create reflection resources if enabled
   if (enablePlanarReflections) {
@@ -732,7 +734,9 @@ void Renderer::recreateSwapChain() {
   createSyncObjects();
 
   // Recreate off-screen opaque scene color and descriptor sets needed by transparent pass
-  createOpaqueSceneColorResources();
+  if (!createOpaqueSceneColorResources()) {
+    throw std::runtime_error("recreateSwapChain: failed to create scene color resources (out of device memory?)");
+  }
   createTransparentDescriptorSets();
   createTransparentFallbackDescriptorSets();
 

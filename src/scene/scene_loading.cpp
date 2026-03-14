@@ -571,6 +571,10 @@ bool LoadGLTFModel(Engine* engine,
     renderer->SetLoadingPhaseProgress(0.0f);
     std::cout << "Requesting acceleration structure build for loaded scene..." << std::endl;
     renderer->RequestAccelerationStructureBuild();
+  } else {
+    // No AS build needed — advance directly to Finalizing so the loading overlay can dismiss.
+    renderer->SetLoadingPhase(Renderer::LoadingPhase::Finalizing);
+    renderer->SetLoadingPhaseProgress(1.0f);
   }
 
   return true;
