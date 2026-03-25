@@ -33,6 +33,10 @@
 #include <ktx.h>
 #include <ranges>
 
+// TinyEXR for loading .exr HDR environment maps
+#define TINYEXR_IMPLEMENTATION
+#include "tinyexr.h"
+
 // This file contains resource-related methods from the Renderer class
 
 // Define shared default PBR texture identifiers (static constants)
@@ -49,14 +53,14 @@ bool Renderer::createDepthResources() {
     // Find depth format
     vk::Format depthFormat = findDepthFormat();
 
-    // Create depth image using memory pool
-    std::tie(depthImage, depthImageAllocation) = createImagePooled(
+    // Create depth image using VMA
+    std::tie(depthImage, depthImageAllocation) = createVmaImage(
       swapChainExtent.width,
       swapChainExtent.height,
       depthFormat,
       vk::ImageTiling::eOptimal,
       vk::ImageUsageFlagBits::eDepthStencilAttachment,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      VMA_MEMORY_USAGE_GPU_ONLY);
 
     // Create depth image view
     depthImageView = createImageView(depthImage, depthFormat, vk::ImageAspectFlagBits::eDepth);
@@ -420,37 +424,37 @@ bool Renderer::createTextureImage(const std::string& texturePath_, TextureResour
 
     // Create image with OOM fallback: retry with mipLevels=1 and reduced usage if needed
     try {
-      auto [textureImg, textureImgAllocation] = createImagePooled(
+      auto [textureImg, textureImgAllocation] = createVmaImage(
         texWidth,
         texHeight,
         textureFormat,
         vk::ImageTiling::eOptimal,
         usageFlags,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         /*mipLevels*/
         mipLevels,
         differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         families);
       resources.textureImage = std::move(textureImg);
-      resources.textureImageAllocation = std::move(textureImgAllocation);
+      resources.textureImageAllocation = textureImgAllocation;
     } catch (const std::exception& e) {
       std::cerr << "Image allocation failed (" << resolvedPath << "): " << e.what() << ". Retrying with mipLevels=1..." << std::endl;
       // Retry with a single mip level and no TRANSFER_SRC usage to reduce memory pressure
       mipLevels = 1;
       usageFlags &= ~vk::ImageUsageFlagBits::eTransferSrc;
-      auto [textureImg2, textureImgAllocation2] = createImagePooled(
+      auto [textureImg2, textureImgAllocation2] = createVmaImage(
         texWidth,
         texHeight,
         textureFormat,
         vk::ImageTiling::eOptimal,
         usageFlags,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         /*mipLevels*/
         mipLevels,
         differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         families);
       resources.textureImage = std::move(textureImg2);
-      resources.textureImageAllocation = std::move(textureImgAllocation2);
+      resources.textureImageAllocation = textureImgAllocation2;
     }
 
     // GPU upload for this texture (copies all regions provided)
@@ -575,17 +579,17 @@ bool Renderer::createDefaultTextureResources() {
     memcpy(data, pixels.data(), static_cast<size_t>(imageSize));
     stagingBufferMemory.unmapMemory();
 
-    // Create texture image using memory pool
-    auto [textureImg, textureImgAllocation] = createImagePooled(
+    // Create texture image using VMA
+    auto [textureImg, textureImgAllocation] = createVmaImage(
       width,
       height,
       vk::Format::eR8G8B8A8Srgb,
       vk::ImageTiling::eOptimal,
       vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      VMA_MEMORY_USAGE_GPU_ONLY);
 
     defaultTextureResources.textureImage = std::move(textureImg);
-    defaultTextureResources.textureImageAllocation = std::move(textureImgAllocation);
+    defaultTextureResources.textureImageAllocation = textureImgAllocation;
 
     // Transition image layout for copy
     transitionImageLayout(
@@ -879,35 +883,35 @@ bool Renderer::LoadTextureFromMemory(const std::string& textureId,
 
     // OOM-resilient allocation
     try {
-      auto [textureImg, textureImgAllocation] = createImagePooled(
+      auto [textureImg, textureImgAllocation] = createVmaImage(
         width,
         height,
         textureFormat,
         vk::ImageTiling::eOptimal,
         usageFlags,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         mipLevels,
         differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         families);
 
       resources.textureImage = std::move(textureImg);
-      resources.textureImageAllocation = std::move(textureImgAllocation);
+      resources.textureImageAllocation = textureImgAllocation;
     } catch (const std::exception& e) {
       std::cerr << "Image allocation failed (memory texture): " << e.what() << ". Retrying with mipLevels=1..." << std::endl;
       mipLevels = 1;
       usageFlags &= ~vk::ImageUsageFlagBits::eTransferSrc;
-      auto [textureImg, textureImgAllocation] = createImagePooled(
+      auto [textureImg, textureImgAllocation] = createVmaImage(
         width,
         height,
         textureFormat,
         vk::ImageTiling::eOptimal,
         usageFlags,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         mipLevels,
         differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
         families);
       resources.textureImage = std::move(textureImg);
-      resources.textureImageAllocation = std::move(textureImgAllocation);
+      resources.textureImageAllocation = textureImgAllocation;
     }
 
     // GPU upload. Copy buffer to image in a single submit.
@@ -1027,27 +1031,29 @@ bool Renderer::createMeshResources(MeshComponent* meshComponent, bool deferUploa
     std::memcpy(indexData, indices.data(), static_cast<size_t>(indexBufferSize));
     stagingIndexBufferMemory.unmapMemory();
 
-    // --- 2. Create device-local vertex and index buffers via the memory pool ---
-    // Add ray tracing flags: eShaderDeviceAddress for vkGetBufferDeviceAddress and
-    // eAccelerationStructureBuildInputReadOnlyKHR for acceleration structure building
-    auto [vertexBuffer, vertexBufferAllocation] = createBufferPooled(
-      vertexBufferSize,
-      vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer |
-      vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+    // --- 2. Create device-local vertex and index buffers via VMA ---
+    // AS build-input flags are only valid when VK_KHR_acceleration_structure is present.
+    const vk::BufferUsageFlags asFlags = accelerationStructureEnabled
+      ? (vk::BufferUsageFlagBits::eShaderDeviceAddress |
+         vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR)
+      : vk::BufferUsageFlags{};
 
-    auto [indexBuffer, indexBufferAllocation] = createBufferPooled(
+    auto [vertexBuffer, vertexBufferAllocation] = createVmaBuffer(
+      vertexBufferSize,
+      vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eVertexBuffer | asFlags,
+      VMA_MEMORY_USAGE_GPU_ONLY);
+
+    auto [indexBuffer, indexBufferAllocation] = createVmaBuffer(
       indexBufferSize,
-      vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer |
-      vk::BufferUsageFlagBits::eShaderDeviceAddress | vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndexBuffer | asFlags,
+      VMA_MEMORY_USAGE_GPU_ONLY);
 
     // --- 3. Either copy now (legacy path) or defer copies for batched submission ---
     MeshResources resources;
     resources.vertexBuffer = std::move(vertexBuffer);
-    resources.vertexBufferAllocation = std::move(vertexBufferAllocation);
+    resources.vertexBufferAllocation = vertexBufferAllocation;
     resources.indexBuffer = std::move(indexBuffer);
-    resources.indexBufferAllocation = std::move(indexBufferAllocation);
+    resources.indexBufferAllocation = indexBufferAllocation;
     resources.indexCount = static_cast<uint32_t>(indices.size());
 
     if (deferUpload) {
@@ -1097,22 +1103,25 @@ bool Renderer::createUniformBuffers(Entity* entity) {
     // Create entity resources
     EntityResources resources;
 
-    // Create uniform buffers using memory pool
+    // Create uniform buffers using VMA (host-visible, persistently mapped)
     vk::DeviceSize bufferSize = sizeof(UniformBufferObject);
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-      auto [buffer, bufferAllocation] = createBufferPooled(
+      auto [buffer, bufferAllocation] = createVmaBuffer(
         bufferSize,
         vk::BufferUsageFlagBits::eUniformBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-      // Use the memory pool's mapped pointer if available
-      void* mappedMemory = bufferAllocation->mappedPtr;
+      // Get persistent mapped pointer from VMA
+      VmaAllocationInfo allocInfo{};
+      vmaGetAllocationInfo(vmaAllocator, bufferAllocation, &allocInfo);
+      void* mappedMemory = allocInfo.pMappedData;
       if (!mappedMemory) {
         std::cerr << "Warning: Uniform buffer allocation is not mapped" << std::endl;
       }
 
       resources.uniformBuffers.emplace_back(std::move(buffer));
-      resources.uniformBufferAllocations.emplace_back(std::move(bufferAllocation));
+      resources.uniformBufferAllocations.emplace_back(bufferAllocation);
       resources.uniformBuffersMapped.emplace_back(mappedMemory);
     }
 
@@ -1140,13 +1149,16 @@ bool Renderer::createUniformBuffers(Entity* entity) {
 
       vk::DeviceSize instanceBufferSize = sizeof(InstanceData) * instanceData.size();
 
-      auto [instanceBuffer, instanceBufferAllocation] = createBufferPooled(
+      auto [instanceBuffer, instanceBufferAllocation] = createVmaBuffer(
         instanceBufferSize,
         vk::BufferUsageFlagBits::eVertexBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-      // Copy instance data to buffer
-      void* instanceMappedMemory = instanceBufferAllocation->mappedPtr;
+      // Get persistent mapped pointer from VMA
+      VmaAllocationInfo instanceAllocInfo{};
+      vmaGetAllocationInfo(vmaAllocator, instanceBufferAllocation, &instanceAllocInfo);
+      void* instanceMappedMemory = instanceAllocInfo.pMappedData;
       if (instanceMappedMemory) {
         std::memcpy(instanceMappedMemory, instanceData.data(), instanceBufferSize);
       } else {
@@ -1154,7 +1166,7 @@ bool Renderer::createUniformBuffers(Entity* entity) {
       }
 
       resources.instanceBuffer = std::move(instanceBuffer);
-      resources.instanceBufferAllocation = std::move(instanceBufferAllocation);
+      resources.instanceBufferAllocation = instanceBufferAllocation;
       resources.instanceBufferMapped = instanceMappedMemory;
     }
 
@@ -1203,7 +1215,11 @@ bool Renderer::createDescriptorPool() {
 
     // Reserve extra combined image sampler capacity for Ray Query binding 6 (baseColor texture array)
     const uint32_t rqTexDescriptors = MAX_FRAMES_IN_FLIGHT * RQ_MAX_TEX;
-    std::array<vk::DescriptorPoolSize, 5> poolSizes = {
+    // Build pool sizes conditionally: AS and storage-image types require the
+    // VK_KHR_acceleration_structure extension.  Including them on non-RT hardware
+    // puts the validation layer's internal tracking in an inconsistent state and
+    // causes it to SIGSEGV inside vkUpdateDescriptorSets later.
+    std::vector<vk::DescriptorPoolSize> poolSizes = {
       vk::DescriptorPoolSize{
         .type = vk::DescriptorType::eUniformBuffer,
         .descriptorCount = uboDescriptors
@@ -1216,15 +1232,17 @@ bool Renderer::createDescriptorPool() {
         .type = vk::DescriptorType::eStorageBuffer,
         .descriptorCount = storageBufferDescriptors
       },
-      vk::DescriptorPoolSize{
+    };
+    if (accelerationStructureEnabled) {
+      poolSizes.push_back(vk::DescriptorPoolSize{
         .type = vk::DescriptorType::eAccelerationStructureKHR,
         .descriptorCount = accelerationStructureDescriptors
-      },
-      vk::DescriptorPoolSize{
+      });
+      poolSizes.push_back(vk::DescriptorPoolSize{
         .type = vk::DescriptorType::eStorageImage,
         .descriptorCount = storageImageDescriptors
-      }
-    };
+      });
+    }
 
     // Create descriptor pool
     vk::DescriptorPoolCreateFlags poolFlags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
@@ -1345,6 +1363,31 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
           descriptorWrites.push_back({.dstSet = *targetDescriptorSets[i], .dstBinding = static_cast<uint32_t>(j + 1), .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &imageInfos[j]});
         }
 
+        // Binding 6: light storage buffer.
+        // Create a minimal dummy buffer if lightStorageBuffers isn't initialised yet
+        // (e.g. when the scene has no lights or the picker path runs before the first
+        // updateLightStorageBuffer call).  Binding 6 must always be written so the
+        // descriptor set is fully valid; the shader guards on ubo.lightCount == 0.
+        if (lightStorageBuffers.size() <= i || !*lightStorageBuffers[i].buffer) {
+          if (lightStorageBuffers.size() <= i)
+            lightStorageBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+          if (!*lightStorageBuffers[i].buffer) {
+            vk::DeviceSize dummySize = sizeof(uint32_t) * 4;
+            auto [buf, alloc] = createVmaBuffer(dummySize,
+                                                vk::BufferUsageFlagBits::eStorageBuffer,
+                                                VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+            lightStorageBuffers[i].buffer     = std::move(buf);
+            lightStorageBuffers[i].allocation = alloc;
+            {
+              VmaAllocationInfo ai{};
+              vmaGetAllocationInfo(vmaAllocator, alloc, &ai);
+              if (ai.pMappedData) std::memset(ai.pMappedData, 0, dummySize);
+            }
+            lightStorageBuffers[i].capacity = 0;
+            lightStorageBuffers[i].size     = 0;
+          }
+        }
         lightBufferInfo = vk::DescriptorBufferInfo{.buffer = *lightStorageBuffers[i].buffer, .range = VK_WHOLE_SIZE};
         descriptorWrites.push_back({.dstSet = *targetDescriptorSets[i], .dstBinding = 6, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &lightBufferInfo});
 
@@ -1358,14 +1401,14 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
           auto& f = forwardPlusPerFrame[i];
           if (!*f.tileHeaders) {
             vk::DeviceSize minSize = sizeof(uint32_t) * 4; // Single TileHeader {offset, count, pad0, pad1}
-            auto [buf, alloc] = createBufferPooled(minSize,
-                                                   vk::BufferUsageFlagBits::eStorageBuffer,
-                                                   vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            auto [buf, alloc] = createVmaBuffer(minSize,
+                                                vk::BufferUsageFlagBits::eStorageBuffer,
+                                                VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
             f.tileHeaders = std::move(buf);
-            f.tileHeadersAlloc = std::move(alloc);
-            if (!!f.tileHeadersAlloc && f.tileHeadersAlloc->mappedPtr) {
-              std::memset(f.tileHeadersAlloc->mappedPtr, 0, minSize);
-            }
+            f.tileHeadersAlloc = alloc;
+            VmaAllocationInfo hdrAllocInfo{}; vmaGetAllocationInfo(vmaAllocator, f.tileHeadersAlloc, &hdrAllocInfo);
+            if (hdrAllocInfo.pMappedData) { std::memset(hdrAllocInfo.pMappedData, 0, minSize); }
           }
           headersInfo = vk::DescriptorBufferInfo{.buffer = *f.tileHeaders, .offset = 0, .range = VK_WHOLE_SIZE};
         }
@@ -1375,14 +1418,14 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
           auto& f = forwardPlusPerFrame[i];
           if (!*f.tileLightIndices) {
             vk::DeviceSize minSize = sizeof(uint32_t) * 4; // Minimal array of 4 uints
-            auto [buf, alloc] = createBufferPooled(minSize,
-                                                   vk::BufferUsageFlagBits::eStorageBuffer,
-                                                   vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+            auto [buf, alloc] = createVmaBuffer(minSize,
+                                                vk::BufferUsageFlagBits::eStorageBuffer,
+                                                VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
             f.tileLightIndices = std::move(buf);
-            f.tileLightIndicesAlloc = std::move(alloc);
-            if (!!f.tileLightIndicesAlloc && f.tileLightIndicesAlloc->mappedPtr) {
-              std::memset(f.tileLightIndicesAlloc->mappedPtr, 0, minSize);
-            }
+            f.tileLightIndicesAlloc = alloc;
+            VmaAllocationInfo idxAllocInfo{}; vmaGetAllocationInfo(vmaAllocator, f.tileLightIndicesAlloc, &idxAllocInfo);
+            if (idxAllocInfo.pMappedData) { std::memset(idxAllocInfo.pMappedData, 0, minSize); }
           }
           indicesInfo = vk::DescriptorBufferInfo{.buffer = *f.tileLightIndices, .offset = 0, .range = VK_WHOLE_SIZE};
         }
@@ -1406,24 +1449,23 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
           .pImageInfo = &reflInfo
         });
 
-        // Binding 11: TLAS (ray-query shadows in raster fragment shader)
-        // The PBR pipeline layout always declares this binding; it must be written before any draw.
-        // Bind the current TLAS when AS is enabled.
+        // Binding 11: TLAS — only write when AS is actually available.
+        // The layout uses ePartiallyBound so leaving it unwritten on non-RT hardware is valid.
         if (accelerationStructureEnabled) {
           vk::AccelerationStructureKHR h = *tlasStructure.handle;
           if (!!h)
             tlasHandleValue = h;
-        }
-        tlasInfo.accelerationStructureCount = 1;
-        tlasInfo.pAccelerationStructures = &tlasHandleValue;
-        vk::WriteDescriptorSet tlasWrite{};
-        tlasWrite.dstSet = *targetDescriptorSets[i];
-        tlasWrite.dstBinding = 11;
-        tlasWrite.dstArrayElement = 0;
-        tlasWrite.descriptorCount = 1;
-        tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
-        tlasWrite.pNext = &tlasInfo;
-        descriptorWrites.push_back(tlasWrite); {
+          tlasInfo.accelerationStructureCount = 1;
+          tlasInfo.pAccelerationStructures = &tlasHandleValue;
+          vk::WriteDescriptorSet tlasWrite{};
+          tlasWrite.dstSet = *targetDescriptorSets[i];
+          tlasWrite.dstBinding = 11;
+          tlasWrite.dstArrayElement = 0;
+          tlasWrite.descriptorCount = 1;
+          tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
+          tlasWrite.pNext = &tlasInfo;
+          descriptorWrites.push_back(tlasWrite);
+        } {
           std::lock_guard<std::mutex> lk(descriptorMutex);
           device.updateDescriptorSets(descriptorWrites, {});
         }
@@ -1984,14 +2026,17 @@ bool Renderer::recreateInstanceBuffer(Entity* entity) {
 
     vk::DeviceSize instanceBufferSize = sizeof(InstanceData) * instanceData.size();
 
-    // Create new instance buffer using memory pool
-    auto [instanceBuffer, instanceBufferAllocation] = createBufferPooled(
+    // Create new instance buffer using VMA
+    auto [instanceBuffer, instanceBufferAllocation] = createVmaBuffer(
       instanceBufferSize,
       vk::BufferUsageFlagBits::eVertexBuffer,
-      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      VMA_MEMORY_USAGE_CPU_TO_GPU,
+      VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-    // Copy instance data to buffer
-    void* instanceMappedMemory = instanceBufferAllocation->mappedPtr;
+    // Get persistent mapped pointer from VMA
+    VmaAllocationInfo instAllocInfo{};
+    vmaGetAllocationInfo(vmaAllocator, instanceBufferAllocation, &instAllocInfo);
+    void* instanceMappedMemory = instAllocInfo.pMappedData;
     if (instanceMappedMemory) {
       std::memcpy(instanceMappedMemory, instanceData.data(), instanceBufferSize);
     } else {
@@ -2000,8 +2045,11 @@ bool Renderer::recreateInstanceBuffer(Entity* entity) {
 
     // Replace the old instance buffer with the new one.
     // Note: Caller must ensure GPU is idle before this method is called to safely destroy the old buffer.
+    if (resources.instanceBufferAllocation) {
+      vmaFreeMemory(vmaAllocator, resources.instanceBufferAllocation);
+    }
     resources.instanceBuffer = std::move(instanceBuffer);
-    resources.instanceBufferAllocation = std::move(instanceBufferAllocation);
+    resources.instanceBufferAllocation = instanceBufferAllocation;
     resources.instanceBufferMapped = instanceMappedMemory;
 
     std::cout << "[Animation] Recreated instance buffer for entity '" << entity->GetName()
@@ -2015,43 +2063,38 @@ bool Renderer::recreateInstanceBuffer(Entity* entity) {
   }
 }
 
-// Create buffer using memory pool for efficient allocation
-std::pair<vk::raii::Buffer, std::unique_ptr<MemoryPool::Allocation>> Renderer::createBufferPooled(
+// Create buffer using VMA
+std::pair<vk::raii::Buffer, VmaAllocation> Renderer::createVmaBuffer(
   vk::DeviceSize size,
   vk::BufferUsageFlags usage,
-  vk::MemoryPropertyFlags properties) {
-  try {
-    if (!memoryPool) {
-      throw std::runtime_error("Memory pool not initialized");
-    }
+  VmaMemoryUsage memUsage,
+  VmaAllocationCreateFlags allocFlags)
+{
+  VkBufferCreateInfo bufCI{};
+  bufCI.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufCI.size        = size;
+  bufCI.usage       = static_cast<VkBufferUsageFlags>(usage);
+  bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    // Use memory pool for allocation
-    auto [buffer, allocation] = memoryPool->createBuffer(size, usage, properties);
+  VmaAllocationCreateInfo allocCI{};
+  allocCI.usage = memUsage;
+  allocCI.flags = allocFlags;
 
-    return {std::move(buffer), std::move(allocation)};
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to create buffer with memory pool: " << e.what() << std::endl;
-    throw;
-  }
+  VkBuffer      rawBuf;
+  VmaAllocation alloc;
+  if (vmaCreateBuffer(vmaAllocator, &bufCI, &allocCI, &rawBuf, &alloc, nullptr) != VK_SUCCESS)
+    throw std::runtime_error("vmaCreateBuffer failed");
+
+  return { vk::raii::Buffer(device, rawBuf), alloc };
 }
 
-// Legacy createBuffer function - now strictly enforces memory pool usage
+// Legacy createBuffer function - used for temporary staging buffers during resource creation
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> Renderer::createBuffer(
   vk::DeviceSize size,
   vk::BufferUsageFlags usage,
   vk::MemoryPropertyFlags properties) {
-  // This function should only be used for temporary staging buffers during resource creation
-  // All persistent resources should use createBufferPooled directly
-
-  if (!memoryPool) {
-    throw std::runtime_error("Memory pool not available - cannot create buffer");
-  }
-
-  // Only allow direct allocation for staging buffers (temporary, host-visible)
-  if (!(properties & vk::MemoryPropertyFlagBits::eHostVisible)) {
-    std::cerr << "ERROR: Legacy createBuffer should only be used for staging buffers!" << std::endl;
-    throw std::runtime_error("Legacy createBuffer used for non-staging buffer");
-  }
+  // This function is used for temporary staging buffers only
+  // Persistent resources should use createVmaBuffer
 
   try {
     vk::BufferCreateInfo bufferInfo{
@@ -2167,17 +2210,17 @@ bool Renderer::createOpaqueSceneColorResources() {
     opaqueSceneColorImageLayouts.reserve(MAX_FRAMES_IN_FLIGHT);
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
-      auto [image, allocation] = createImagePooled(
+      auto [image, allocation] = createVmaImage(
         swapChainExtent.width,
         swapChainExtent.height,
         swapChainImageFormat,
         // Use the same format as the swapchain
         vk::ImageTiling::eOptimal,
         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
+        VMA_MEMORY_USAGE_GPU_ONLY);
 
       opaqueSceneColorImages.push_back(std::move(image));
-      opaqueSceneColorImageAllocations.push_back(std::move(allocation));
+      opaqueSceneColorImageAllocations.push_back(allocation);
       opaqueSceneColorImageViews.push_back(createImageView(opaqueSceneColorImages.back(), swapChainImageFormat, vk::ImageAspectFlagBits::eColor));
       opaqueSceneColorImageLayouts.push_back(vk::ImageLayout::eUndefined);
     }
@@ -2298,38 +2341,46 @@ std::pair<vk::raii::Image, vk::raii::DeviceMemory> Renderer::createImage(
   }
 }
 
-// Create image using memory pool for efficient allocation
-std::pair<vk::raii::Image, std::unique_ptr<MemoryPool::Allocation>> Renderer::createImagePooled(
+// Create image using VMA
+std::pair<vk::raii::Image, VmaAllocation> Renderer::createVmaImage(
   uint32_t width,
   uint32_t height,
   vk::Format format,
   vk::ImageTiling tiling,
   vk::ImageUsageFlags usage,
-  vk::MemoryPropertyFlags properties,
+  VmaMemoryUsage memUsage,
   uint32_t mipLevels,
   vk::SharingMode sharingMode,
-  const std::vector<uint32_t>& queueFamilies) {
-  try {
-    if (!memoryPool) {
-      throw std::runtime_error("Memory pool not initialized");
-    }
-
-    // Use memory pool for allocation (mipmap support limited by memory pool API)
-    auto [image, allocation] = memoryPool->createImage(width,
-                                                       height,
-                                                       format,
-                                                       tiling,
-                                                       usage,
-                                                       properties,
-                                                       mipLevels,
-                                                       sharingMode,
-                                                       queueFamilies);
-
-    return {std::move(image), std::move(allocation)};
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to create image with memory pool: " << e.what() << std::endl;
-    throw;
+  const std::vector<uint32_t>& queueFamilyIndices)
+{
+  VkImageCreateInfo imgCI{};
+  imgCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imgCI.imageType     = VK_IMAGE_TYPE_2D;
+  imgCI.extent.width  = width;
+  imgCI.extent.height = height;
+  imgCI.extent.depth  = 1;
+  imgCI.mipLevels     = mipLevels;
+  imgCI.arrayLayers   = 1;
+  imgCI.format        = static_cast<VkFormat>(format);
+  imgCI.tiling        = static_cast<VkImageTiling>(tiling);
+  imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  imgCI.usage         = static_cast<VkImageUsageFlags>(usage);
+  imgCI.samples       = VK_SAMPLE_COUNT_1_BIT;
+  imgCI.sharingMode   = static_cast<VkSharingMode>(sharingMode);
+  if (!queueFamilyIndices.empty()) {
+    imgCI.queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size());
+    imgCI.pQueueFamilyIndices   = queueFamilyIndices.data();
   }
+
+  VmaAllocationCreateInfo allocCI{};
+  allocCI.usage = memUsage;
+
+  VkImage       rawImg;
+  VmaAllocation alloc;
+  if (vmaCreateImage(vmaAllocator, &imgCI, &allocCI, &rawImg, &alloc, nullptr) != VK_SUCCESS)
+    throw std::runtime_error("vmaCreateImage failed");
+
+  return { vk::raii::Image(device, rawImg), alloc };
 }
 
 // Create an image view
@@ -2571,24 +2622,28 @@ bool Renderer::createOrResizeLightStorageBuffers(size_t lightCount) {
       auto& buffer = lightStorageBuffers[i];
 
       // Clean up old buffer if it exists (now safe after waitIdle)
-      if (!!buffer.allocation) {
+      if (buffer.allocation) {
         buffer.buffer = vk::raii::Buffer(nullptr);
-        buffer.allocation.reset();
+        vmaFreeMemory(vmaAllocator, buffer.allocation);
+        buffer.allocation = VK_NULL_HANDLE;
         buffer.mapped = nullptr;
       }
 
       // Create new storage buffer
-      auto [newBuffer, newAllocation] = createBufferPooled(
+      auto [newBuffer, newAllocation] = createVmaBuffer(
         bufferSize,
         vk::BufferUsageFlagBits::eStorageBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
       // Get the mapped pointer from the allocation
-      void* mapped = newAllocation->mappedPtr;
+      VmaAllocationInfo lightAllocInfo{};
+      vmaGetAllocationInfo(vmaAllocator, newAllocation, &lightAllocInfo);
+      void* mapped = lightAllocInfo.pMappedData;
 
       // Store the new buffer
       buffer.buffer = std::move(newBuffer);
-      buffer.allocation = std::move(newAllocation);
+      buffer.allocation = newAllocation;
       buffer.mapped = mapped;
       buffer.capacity = newCapacity;
       buffer.size = 0;
@@ -2715,16 +2770,21 @@ void Renderer::refreshPBRForwardPlusBindingsForFrame(uint32_t frameIndex) {
       }
       if (frameIndex < lightStorageBuffers.size() && !*lightStorageBuffers[frameIndex].buffer) {
         vk::DeviceSize minSize = sizeof(LightData); // Single light element
-        auto [buf, alloc] = createBufferPooled(minSize,
-                                               vk::BufferUsageFlagBits::eStorageBuffer,
-                                               vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        auto [buf, alloc] = createVmaBuffer(minSize,
+                                            vk::BufferUsageFlagBits::eStorageBuffer,
+                                            VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
         lightStorageBuffers[frameIndex].buffer = std::move(buf);
-        lightStorageBuffers[frameIndex].allocation = std::move(alloc);
-        lightStorageBuffers[frameIndex].mapped = lightStorageBuffers[frameIndex].allocation->mappedPtr;
+        lightStorageBuffers[frameIndex].allocation = alloc;
+        {
+          VmaAllocationInfo lsAllocInfo{};
+          vmaGetAllocationInfo(vmaAllocator, alloc, &lsAllocInfo);
+          lightStorageBuffers[frameIndex].mapped = lsAllocInfo.pMappedData;
+        }
         lightStorageBuffers[frameIndex].capacity = 1;
         lightStorageBuffers[frameIndex].size = 0;
         // Zero-initialize to prevent garbage data
-        if (!!lightStorageBuffers[frameIndex].mapped) {
+        if (lightStorageBuffers[frameIndex].mapped) {
           std::memset(lightStorageBuffers[frameIndex].mapped, 0, minSize);
         }
       }
@@ -2742,14 +2802,14 @@ void Renderer::refreshPBRForwardPlusBindingsForFrame(uint32_t frameIndex) {
         auto& f = forwardPlusPerFrame[frameIndex];
         if (!*f.tileHeaders) {
           vk::DeviceSize minSize = sizeof(uint32_t) * 4; // Single TileHeader {offset, count, pad0, pad1}
-          auto [buf, alloc] = createBufferPooled(minSize,
-                                                 vk::BufferUsageFlagBits::eStorageBuffer,
-                                                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+          auto [buf, alloc] = createVmaBuffer(minSize,
+                                              vk::BufferUsageFlagBits::eStorageBuffer,
+                                              VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
           f.tileHeaders = std::move(buf);
-          f.tileHeadersAlloc = std::move(alloc);
-          if (!!f.tileHeadersAlloc && f.tileHeadersAlloc->mappedPtr) {
-            std::memset(f.tileHeadersAlloc->mappedPtr, 0, minSize);
-          }
+          f.tileHeadersAlloc = alloc;
+          VmaAllocationInfo hdrInfo{}; vmaGetAllocationInfo(vmaAllocator, f.tileHeadersAlloc, &hdrInfo);
+          if (hdrInfo.pMappedData) { std::memset(hdrInfo.pMappedData, 0, minSize); }
         }
         if (!!*f.tileHeaders)
           headersBuf = *f.tileHeaders;
@@ -2765,14 +2825,14 @@ void Renderer::refreshPBRForwardPlusBindingsForFrame(uint32_t frameIndex) {
         auto& f = forwardPlusPerFrame[frameIndex];
         if (!*f.tileLightIndices) {
           vk::DeviceSize minSize = sizeof(uint32_t) * 4; // Minimal array of 4 uints
-          auto [buf, alloc] = createBufferPooled(minSize,
-                                                 vk::BufferUsageFlagBits::eStorageBuffer,
-                                                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+          auto [buf, alloc] = createVmaBuffer(minSize,
+                                              vk::BufferUsageFlagBits::eStorageBuffer,
+                                              VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
           f.tileLightIndices = std::move(buf);
-          f.tileLightIndicesAlloc = std::move(alloc);
-          if (!!f.tileLightIndicesAlloc && f.tileLightIndicesAlloc->mappedPtr) {
-            std::memset(f.tileLightIndicesAlloc->mappedPtr, 0, minSize);
-          }
+          f.tileLightIndicesAlloc = alloc;
+          VmaAllocationInfo idxInfo{}; vmaGetAllocationInfo(vmaAllocator, f.tileLightIndicesAlloc, &idxInfo);
+          if (idxInfo.pMappedData) { std::memset(idxInfo.pMappedData, 0, minSize); }
         }
         if (!!*f.tileLightIndices)
           indicesBuf = *f.tileLightIndices;
@@ -2812,9 +2872,8 @@ void Renderer::refreshPBRForwardPlusBindingsForFrame(uint32_t frameIndex) {
     vk::DescriptorImageInfo reflInfo{};
     reflInfo = vk::DescriptorImageInfo{.sampler = *defaultTextureResources.textureSampler, .imageView = *defaultTextureResources.textureImageView, .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
 
-    // Binding 11: TLAS (for raster ray-query shadows)
-    // Raster PBR shaders can statically declare/use `tlas` even when ray-query mode is disabled,
-    // so the descriptor must be written whenever acceleration structures are enabled.
+    // Binding 11: TLAS (for raster ray-query shadows) — only valid when AS is available.
+    // The layout uses ePartiallyBound so on non-RT hardware we simply skip writing it.
     vk::AccelerationStructureKHR tlasHandleValue = accelerationStructureEnabled ? *tlasStructure.handle : vk::AccelerationStructureKHR{};
     vk::WriteDescriptorSetAccelerationStructureKHR tlasInfo{};
     tlasInfo.accelerationStructureCount = 1;
@@ -2850,16 +2909,17 @@ void Renderer::refreshPBRForwardPlusBindingsForFrame(uint32_t frameIndex) {
       // Binding 10: reflection sampler - ALWAYS bind (required by layout)
       writes.push_back(vk::WriteDescriptorSet{.dstSet = *res.pbrDescriptorSets[frameIndex], .dstBinding = 10, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &reflInfo});
 
-      // Binding 11: TLAS - ALWAYS bind (required by layout when ray query/AS is enabled)
-      // If TLAS is not built yet, the handle will be null; the shader must not trace when disabled.
-      vk::WriteDescriptorSet tlasWrite{};
-      tlasWrite.dstSet = *res.pbrDescriptorSets[frameIndex];
-      tlasWrite.dstBinding = 11;
-      tlasWrite.dstArrayElement = 0;
-      tlasWrite.descriptorCount = 1;
-      tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
-      tlasWrite.pNext = &tlasInfo;
-      writes.push_back(tlasWrite);
+      // Binding 11: TLAS — only write when AS is actually available (ePartiallyBound handles non-RT).
+      if (accelerationStructureEnabled) {
+        vk::WriteDescriptorSet tlasWrite{};
+        tlasWrite.dstSet = *res.pbrDescriptorSets[frameIndex];
+        tlasWrite.dstBinding = 11;
+        tlasWrite.dstArrayElement = 0;
+        tlasWrite.descriptorCount = 1;
+        tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
+        tlasWrite.pNext = &tlasInfo;
+        writes.push_back(tlasWrite);
+      }
 
       // Binding 12/13: Ray-query geometry/material buffers for material-aware raster shadow queries.
       // Always bind something valid; shader guards on `ubo.geometryInfoCount/materialCount`.
@@ -3133,15 +3193,15 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
             // Build staging buffers and images without submitting yet
             struct Item {
               std::string id;
-              vk::raii::Buffer staging;
-              std::unique_ptr<MemoryPool::Allocation> stagingAlloc;
+              vk::raii::Buffer staging{nullptr};
+              VmaAllocation stagingAlloc = VK_NULL_HANDLE;
               std::vector<uint8_t> tmp;
               uint32_t w, h;
               vk::Format format;
               std::vector<vk::BufferImageCopy> regions;
               uint32_t mipLevels;
-              vk::raii::Image image;
-              std::unique_ptr<MemoryPool::Allocation> imageAlloc;
+              vk::raii::Image image{nullptr};
+              VmaAllocation imageAlloc = VK_NULL_HANDLE;
             };
             std::vector<Item> items;
             items.reserve(memJobs.size());
@@ -3150,8 +3210,9 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
               try {
                 // Create staging buffer and copy data
                 const vk::DeviceSize imgSize = static_cast<vk::DeviceSize>(job.width * job.height * 4);
-                auto [stagingBuf, stagingAlloc] = createBufferPooled(imgSize, vk::BufferUsageFlagBits::eTransferSrc, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-                void* mapped = stagingAlloc->mappedPtr;
+                auto [stagingBuf, stagingAlloc] = createVmaBuffer(imgSize, vk::BufferUsageFlagBits::eTransferSrc, VMA_MEMORY_USAGE_CPU_ONLY, VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                VmaAllocationInfo stgInfo{}; vmaGetAllocationInfo(vmaAllocator, stagingAlloc, &stgInfo);
+                void* mapped = stgInfo.pMappedData;
                 // Convert to RGBA if not already
                 std::vector<uint8_t> rgba;
                 rgba.resize(static_cast<size_t>(imgSize));
@@ -3180,11 +3241,11 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
                   }
                 } else {
                   // unsupported layout, fallback to single path which will handle it
+                  vmaFreeMemory(vmaAllocator, stagingAlloc);
                   processSingle(job);
                   continue;
                 }
                 std::memcpy(mapped, rgba.data(), static_cast<size_t>(imgSize));
-                // Persistent mapping via memory pool; no explicit unmap needed here
 
                 // Create image (concurrent sharing if needed)
                 bool differentFamilies = queueFamilyIndices.graphicsFamily.value() != queueFamilyIndices.transferFamily.value();
@@ -3192,7 +3253,7 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
                 if (differentFamilies)
                   families = {queueFamilyIndices.graphicsFamily.value(), queueFamilyIndices.transferFamily.value()};
                 vk::Format texFormat = determineTextureFormat(job.idOrPath);
-                auto [image, imageAlloc] = createImagePooled(job.width, job.height, texFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled, vk::MemoryPropertyFlagBits::eDeviceLocal, 1, differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive, families);
+                auto [image, imageAlloc] = createVmaImage(job.width, job.height, texFormat, vk::ImageTiling::eOptimal, vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled, VMA_MEMORY_USAGE_GPU_ONLY, 1, differentFamilies ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive, families);
 
                 // Prepare one region
                 std::vector<vk::BufferImageCopy> regions{
@@ -3206,7 +3267,7 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
                   }
                 };
 
-                items.push_back(Item{job.idOrPath, std::move(stagingBuf), std::move(stagingAlloc), std::move(rgba), static_cast<uint32_t>(job.width), static_cast<uint32_t>(job.height), texFormat, std::move(regions), 1, std::move(image), std::move(imageAlloc)});
+                items.push_back(Item{job.idOrPath, std::move(stagingBuf), stagingAlloc, std::move(rgba), static_cast<uint32_t>(job.width), static_cast<uint32_t>(job.height), texFormat, std::move(regions), 1, std::move(image), imageAlloc});
               } catch (const std::exception& e) {
                 std::cerr << "Batch prepare failed for '" << job.idOrPath << "': " << e.what() << ". Falling back to single." << std::endl;
                 processSingle(job);
@@ -3290,10 +3351,15 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
 
               // Finalize resources and notify
               for (auto& it : items) {
+                // Free staging allocations (GPU done, staging no longer needed)
+                if (it.stagingAlloc) {
+                  vmaFreeMemory(vmaAllocator, it.stagingAlloc);
+                  it.stagingAlloc = VK_NULL_HANDLE;
+                }
                 // Store in textureResources
                 TextureResources res;
                 res.textureImage = std::move(it.image);
-                res.textureImageAllocation = std::move(it.imageAlloc);
+                res.textureImageAllocation = it.imageAlloc;
                 res.format = it.format;
                 res.mipLevels = it.mipLevels;
                 res.alphaMaskedHint = false; // heuristic omitted in batch
@@ -3335,12 +3401,10 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
 
         // Process remaining non-memory jobs individually
         // Reserve 512 MB for critical render resources (depth, scene color, swapchain, etc.)
-        // Use `used` (actually consumed bytes) rather than `allocated` (block capacity) so we
-        // don't over-estimate and stop streaming too early.
         constexpr vk::DeviceSize kVRAMReserveBytes = 512ull * 1024 * 1024;
         // Cache device VRAM total once per batch to avoid repeated driver queries.
         vk::DeviceSize deviceLocalTotal = 0;
-        if (memoryPool) {
+        {
           const auto memProps = physicalDevice.getMemoryProperties();
           for (uint32_t i = 0; i < memProps.memoryHeapCount; ++i) {
             if (memProps.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
@@ -3351,11 +3415,19 @@ void Renderer::StartUploadsWorker(size_t workerCount) {
         }
         for (auto& job : batch) {
           const bool isCritical = (job.priority == PendingTextureJob::Priority::Critical);
-          if (!isCritical && memoryPool && deviceLocalTotal > 0) {
-            auto [used, allocated] = memoryPool->getTotalMemoryUsage();
-            // Use `allocated` (total block capacity committed to the driver) as the
-            // budget signal — it reflects actual device memory pressure, not just
-            // the bytes currently occupied within those blocks.
+          if (!isCritical && vmaAllocator && deviceLocalTotal > 0) {
+            // Use VMA budget to check VRAM pressure
+            VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+            vmaGetHeapBudgets(vmaAllocator, budgets);
+            vk::DeviceSize allocated = 0;
+            const auto memProps = physicalDevice.getMemoryProperties();
+            for (uint32_t hi = 0; hi < memProps.memoryHeapCount; ++hi) {
+              if (memProps.memoryHeaps[hi].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                allocated += budgets[hi].usage;
+                break;
+              }
+            }
+            // Use `allocated` (total device-local bytes in use) as the budget signal
             if (allocated + kVRAMReserveBytes > deviceLocalTotal) {
               // VRAM nearly full — skip this non-critical texture to preserve budget
               std::cerr << "UploadsWorker: VRAM budget reached, skipping '" << job.idOrPath << "'" << std::endl;
@@ -3390,6 +3462,14 @@ void Renderer::StopUploadsWorker() {
       th.join();
   }
   uploadsWorkerThreads.clear();
+}
+
+bool Renderer::GetEntityMaterialProps(Entity* entity, MaterialProperties& out) const {
+  if (!entity) return false;
+  auto it = entityResources.find(entity);
+  if (it == entityResources.end()) return false;
+  out = it->second.cachedMaterialProps;
+  return true;
 }
 
 void Renderer::RegisterTextureUser(const std::string& textureId, Entity* entity) {
@@ -3567,25 +3647,33 @@ bool Renderer::updateDescriptorSetsForFrame(Entity* entity,
           indicesBuf = *f.tileLightIndices;
         if (!headersBuf) {
           vk::DeviceSize minSize = sizeof(uint32_t) * 4; // Single TileHeader
-          auto [buf, alloc] = createBufferPooled(minSize,
-                                                 vk::BufferUsageFlagBits::eStorageBuffer,
-                                                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+          auto [buf, alloc] = createVmaBuffer(minSize,
+                                              vk::BufferUsageFlagBits::eStorageBuffer,
+                                              VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
           f.tileHeaders = std::move(buf);
-          f.tileHeadersAlloc = std::move(alloc);
-          if (!!f.tileHeadersAlloc && f.tileHeadersAlloc->mappedPtr) {
-            std::memset(f.tileHeadersAlloc->mappedPtr, 0, minSize);
+          f.tileHeadersAlloc = alloc;
+          {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(vmaAllocator, f.tileHeadersAlloc, &info);
+            if (info.pMappedData)
+              std::memset(info.pMappedData, 0, minSize);
           }
           headersBuf = *f.tileHeaders;
         }
         if (!indicesBuf) {
           vk::DeviceSize minSize = sizeof(uint32_t) * 4;
-          auto [buf, alloc] = createBufferPooled(minSize,
-                                                 vk::BufferUsageFlagBits::eStorageBuffer,
-                                                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+          auto [buf, alloc] = createVmaBuffer(minSize,
+                                              vk::BufferUsageFlagBits::eStorageBuffer,
+                                              VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
           f.tileLightIndices = std::move(buf);
-          f.tileLightIndicesAlloc = std::move(alloc);
-          if (!!f.tileLightIndicesAlloc && f.tileLightIndicesAlloc->mappedPtr) {
-            std::memset(f.tileLightIndicesAlloc->mappedPtr, 0, minSize);
+          f.tileLightIndicesAlloc = alloc;
+          {
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(vmaAllocator, f.tileLightIndicesAlloc, &info);
+            if (info.pMappedData)
+              std::memset(info.pMappedData, 0, minSize);
           }
           indicesBuf = *f.tileLightIndices;
         }
@@ -3603,17 +3691,19 @@ bool Renderer::updateDescriptorSetsForFrame(Entity* entity,
       };
       dstWrites.push_back({.dstSet = *targetDescriptorSets[frameIndex], .dstBinding = 10, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &reflInfo});
 
-      // Binding 11: TLAS (ray-query shadows in raster PBR fragment shader)
-      tlasHandleValue = accelerationStructureEnabled ? *tlasStructure.handle : vk::AccelerationStructureKHR{};
-      tlasInfo.accelerationStructureCount = 1;
-      tlasInfo.pAccelerationStructures = &tlasHandleValue;
-      tlasWrite.dstSet = *targetDescriptorSets[frameIndex];
-      tlasWrite.dstBinding = 11;
-      tlasWrite.dstArrayElement = 0;
-      tlasWrite.descriptorCount = 1;
-      tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
-      tlasWrite.pNext = &tlasInfo;
-      dstWrites.push_back(tlasWrite);
+      // Binding 11: TLAS — only write when AS is actually available (ePartiallyBound on non-RT).
+      if (accelerationStructureEnabled) {
+        tlasHandleValue = *tlasStructure.handle;
+        tlasInfo.accelerationStructureCount = 1;
+        tlasInfo.pAccelerationStructures = &tlasHandleValue;
+        tlasWrite.dstSet = *targetDescriptorSets[frameIndex];
+        tlasWrite.dstBinding = 11;
+        tlasWrite.dstArrayElement = 0;
+        tlasWrite.descriptorCount = 1;
+        tlasWrite.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
+        tlasWrite.pNext = &tlasInfo;
+        dstWrites.push_back(tlasWrite);
+      }
 
       // Binding 12/13: Ray-query geometry/material buffers for material-aware raster shadow queries.
       // Always bind something valid; shader guards on `ubo.geometryInfoCount/materialCount`.
@@ -4093,4 +4183,514 @@ void Renderer::generateMipmaps(vk::Image image,
     graphicsQueue.submit(submit, *fence);
   }
   (void) waitForFencesSafe(*fence, VK_TRUE);
+}
+bool Renderer::createCSMResources() {
+  if (!csmFrames.empty()) return true;
+
+  uint32_t frames = GetMaxFramesInFlight();
+  csmFrames.resize(frames);
+
+  try {
+    for (uint32_t f = 0; f < frames; f++) {
+      auto& csm = csmFrames[f];
+
+      for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+        vk::ImageCreateInfo imageInfo{
+          .imageType     = vk::ImageType::e2D,
+          .format        = vk::Format::eD32Sfloat,
+          .extent        = {CSM_RESOLUTION, CSM_RESOLUTION, 1},
+          .mipLevels     = 1,
+          .arrayLayers   = 1,
+          .samples       = vk::SampleCountFlagBits::e1,
+          .tiling        = vk::ImageTiling::eOptimal,
+          .usage         = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                           vk::ImageUsageFlagBits::eSampled,
+          .sharingMode   = vk::SharingMode::eExclusive,
+          .initialLayout = vk::ImageLayout::eUndefined
+        };
+        csm.images[c] = vk::raii::Image(device, imageInfo);
+
+        auto memReqs  = csm.images[c].getMemoryRequirements();
+        uint32_t memType = findMemoryType(memReqs.memoryTypeBits,
+                                          vk::MemoryPropertyFlagBits::eDeviceLocal);
+        vk::MemoryAllocateInfo allocInfo{.allocationSize = memReqs.size, .memoryTypeIndex = memType};
+        csm.memories[c] = vk::raii::DeviceMemory(device, allocInfo);
+        csm.images[c].bindMemory(*csm.memories[c], 0);
+
+        vk::ImageViewCreateInfo viewInfo{
+          .image    = *csm.images[c],
+          .viewType = vk::ImageViewType::e2D,
+          .format   = vk::Format::eD32Sfloat,
+          .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}
+        };
+        csm.views[c] = vk::raii::ImageView(device, viewInfo);
+        csm.layouts[c] = vk::ImageLayout::eUndefined;
+      }
+
+      // Regular (non-comparison) sampler for manual PCF depth sampling.
+      // The shader uses Sampler2D + .Sample() to read raw depth values, then
+      // does the comparison manually — a VkCompareOp sampler would return 0/1
+      // from .Sample() instead of the actual depth, breaking the PCF.
+      vk::SamplerCreateInfo samplerInfo{
+        .magFilter               = vk::Filter::eNearest,
+        .minFilter               = vk::Filter::eNearest,
+        .mipmapMode              = vk::SamplerMipmapMode::eNearest,
+        .addressModeU            = vk::SamplerAddressMode::eClampToBorder,
+        .addressModeV            = vk::SamplerAddressMode::eClampToBorder,
+        .addressModeW            = vk::SamplerAddressMode::eClampToBorder,
+        .compareEnable           = vk::False,
+        .borderColor             = vk::BorderColor::eFloatOpaqueWhite,
+        .unnormalizedCoordinates = vk::False
+      };
+      csm.shadowSampler = vk::raii::Sampler(device, samplerInfo);
+
+      // CSM UBO buffer (host-visible, coherent)
+      vk::BufferCreateInfo bufInfo{
+        .size        = sizeof(CsmUBO),
+        .usage       = vk::BufferUsageFlagBits::eUniformBuffer,
+        .sharingMode = vk::SharingMode::eExclusive
+      };
+      csm.uboBuffer = vk::raii::Buffer(device, bufInfo);
+      auto bufReqs = csm.uboBuffer.getMemoryRequirements();
+      uint32_t bufMemType = findMemoryType(bufReqs.memoryTypeBits,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      vk::MemoryAllocateInfo bufAlloc{.allocationSize = bufReqs.size, .memoryTypeIndex = bufMemType};
+      csm.uboMemory = vk::raii::DeviceMemory(device, bufAlloc);
+      csm.uboBuffer.bindMemory(*csm.uboMemory, 0);
+      csm.uboMapped = csm.uboMemory.mapMemory(0, sizeof(CsmUBO));
+
+      // Descriptor pool + set for CSM depth pass
+      vk::DescriptorPoolSize poolSize{
+        .type            = vk::DescriptorType::eUniformBuffer,
+        .descriptorCount = 1
+      };
+      vk::DescriptorPoolCreateInfo poolInfo{
+        .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+        .maxSets       = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes    = &poolSize
+      };
+      csm.descriptorPool = vk::raii::DescriptorPool(device, poolInfo);
+
+      vk::DescriptorSetLayout dsl = *csmDepthDescriptorSetLayout;
+      vk::DescriptorSetAllocateInfo dsAllocInfo{
+        .descriptorPool     = *csm.descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts        = &dsl
+      };
+      auto sets = device.allocateDescriptorSets(dsAllocInfo);
+      csm.descriptorSet = std::move(sets[0]);
+
+      vk::DescriptorBufferInfo dbi{.buffer = *csm.uboBuffer, .offset = 0, .range = sizeof(CsmUBO)};
+      vk::WriteDescriptorSet wds{
+        .dstSet          = *csm.descriptorSet,
+        .dstBinding      = 0,
+        .descriptorCount = 1,
+        .descriptorType  = vk::DescriptorType::eUniformBuffer,
+        .pBufferInfo     = &dbi
+      };
+      device.updateDescriptorSets(wds, {});
+    }
+
+    std::cout << "[CSM] CSM resources created (" << frames << " frames, " << CSM_CASCADE_COUNT << " cascades)\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create CSM resources: " << e.what() << std::endl;
+    csmFrames.clear();
+    return false;
+  }
+}
+
+void Renderer::destroyCSMResources() {
+  for (auto& csm : csmFrames) {
+    if (csm.uboMapped && *csm.uboMemory) {
+      csm.uboMemory.unmapMemory();
+      csm.uboMapped = nullptr;
+    }
+  }
+  csmFrames.clear();
+}
+
+// Load an EXR equirectangular HDR environment map and bind it to the sky + water pipelines.
+bool Renderer::LoadEnvTexture(const std::string& path) {
+  try {
+    // --- Load EXR with tinyexr ---
+    float*      exrPixels = nullptr;
+    int         exrW = 0, exrH = 0;
+    const char* exrErr = nullptr;
+    int rc = LoadEXR(&exrPixels, &exrW, &exrH, path.c_str(), &exrErr);
+    if (rc != TINYEXR_SUCCESS) {
+      std::cerr << "[EnvTex] Failed to load EXR '" << path << "': "
+                << (exrErr ? exrErr : "unknown error") << "\n";
+      if (exrErr) FreeEXRErrorMessage(exrErr);
+      return false;
+    }
+    std::cout << "[EnvTex] Loaded EXR " << exrW << "x" << exrH << " from " << path << "\n";
+
+    // LoadEXR returns RGBA float (4 channels). Upload as R32G32B32A32_SFLOAT.
+    const vk::Format fmt   = vk::Format::eR32G32B32A32Sfloat;
+    const vk::DeviceSize sz = static_cast<vk::DeviceSize>(exrW) * exrH * 4 * sizeof(float);
+
+    // --- Staging buffer ---
+    auto [stagingBuf, stagingMem] = createBuffer(
+      sz,
+      vk::BufferUsageFlagBits::eTransferSrc,
+      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    {
+      void* dst = stagingMem.mapMemory(0, sz);
+      memcpy(dst, exrPixels, static_cast<size_t>(sz));
+      stagingMem.unmapMemory();
+    }
+    free(exrPixels);
+    exrPixels = nullptr;
+
+    // --- Create device-local image ---
+    auto [img, imgMem] = createImage(
+      static_cast<uint32_t>(exrW),
+      static_cast<uint32_t>(exrH),
+      fmt,
+      vk::ImageTiling::eOptimal,
+      vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+      vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+    // Transition to transfer dst
+    transitionImageLayout(*img, fmt,
+      vk::ImageLayout::eUndefined,
+      vk::ImageLayout::eTransferDstOptimal);
+
+    // Copy staging -> image
+    vk::BufferImageCopy region{
+      .bufferOffset      = 0,
+      .bufferRowLength   = 0,
+      .bufferImageHeight = 0,
+      .imageSubresource  = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+      .imageOffset       = {0, 0, 0},
+      .imageExtent       = {static_cast<uint32_t>(exrW), static_cast<uint32_t>(exrH), 1}
+    };
+    copyBufferToImage(*stagingBuf, *img,
+      static_cast<uint32_t>(exrW),
+      static_cast<uint32_t>(exrH),
+      region);
+
+    // Transition to shader read
+    transitionImageLayout(*img, fmt,
+      vk::ImageLayout::eTransferDstOptimal,
+      vk::ImageLayout::eShaderReadOnlyOptimal);
+
+    // --- Image view ---
+    vk::ImageViewCreateInfo viewCI{
+      .image    = *img,
+      .viewType = vk::ImageViewType::e2D,
+      .format   = fmt,
+      .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+    };
+    vk::raii::ImageView view(device, viewCI);
+
+    // --- Sampler ---
+    vk::SamplerCreateInfo samplerCI{
+      .magFilter               = vk::Filter::eLinear,
+      .minFilter               = vk::Filter::eLinear,
+      .mipmapMode              = vk::SamplerMipmapMode::eLinear,
+      .addressModeU            = vk::SamplerAddressMode::eRepeat,
+      .addressModeV            = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeW            = vk::SamplerAddressMode::eClampToEdge,
+      .anisotropyEnable        = vk::False,
+      .maxAnisotropy           = 1.0f,
+      .compareEnable           = vk::False,
+      .minLod                  = 0.0f,
+      .maxLod                  = 0.0f,
+      .unnormalizedCoordinates = vk::False
+    };
+    vk::raii::Sampler sampler(device, samplerCI);
+
+    // Commit resources
+    envImage     = std::move(img);
+    envMemory    = std::move(imgMem);
+    envImageView = std::move(view);
+    envSampler   = std::move(sampler);
+    hasEnvTexture = true;
+    useEnvMapForSky = true;  // Auto-enable env map sky when a cubemap is loaded
+
+    // --- Update sky descriptor set ---
+    if (*skyDescriptorSet) {
+      vk::DescriptorImageInfo imgInfo{
+        .sampler     = *envSampler,
+        .imageView   = *envImageView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::WriteDescriptorSet write{
+        .dstSet          = *skyDescriptorSet,
+        .dstBinding      = 0,
+        .descriptorCount = 1,
+        .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+        .pImageInfo      = &imgInfo
+      };
+      device.updateDescriptorSets(write, {});
+      std::cout << "[EnvTex] Sky descriptor set updated.\n";
+    }
+
+    std::cout << "[EnvTex] Environment texture loaded successfully.\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[EnvTex] Exception loading env texture: " << e.what() << "\n";
+    return false;
+  }
+}
+
+// =============================================================================
+// Bloom resources — HDR off-screen image + mip chain
+// =============================================================================
+bool Renderer::createBloomResources() {
+  try {
+    // Reset old resources
+    for (auto& m : bloomMips) {
+      if (m.allocation != VK_NULL_HANDLE && vmaAllocator != VK_NULL_HANDLE) {
+        vmaDestroyImage(vmaAllocator, static_cast<VkImage>(*m.image), m.allocation);
+        m.allocation = VK_NULL_HANDLE;
+      }
+      m.image  = vk::raii::Image(nullptr);
+      m.view   = vk::raii::ImageView(nullptr);
+      m.layout = vk::ImageLayout::eUndefined;
+    }
+    if (hdrColorImageAllocation != VK_NULL_HANDLE && vmaAllocator != VK_NULL_HANDLE) {
+      vmaDestroyImage(vmaAllocator, static_cast<VkImage>(*hdrColorImage), hdrColorImageAllocation);
+      hdrColorImageAllocation = VK_NULL_HANDLE;
+    }
+    hdrColorImage     = vk::raii::Image(nullptr);
+    hdrColorImageView = vk::raii::ImageView(nullptr);
+    hdrColorImageLayout = vk::ImageLayout::eUndefined;
+
+    const vk::Format bloomFmt = vk::Format::eR16G16B16A16Sfloat;
+    const uint32_t w = swapChainExtent.width;
+    const uint32_t h = swapChainExtent.height;
+
+    // HDR off-screen color image (full resolution)
+    {
+      auto [img, alloc] = createVmaImage(w, h, bloomFmt,
+        vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eColorAttachment |
+        vk::ImageUsageFlagBits::eSampled         |
+        vk::ImageUsageFlagBits::eTransferSrc,
+        VMA_MEMORY_USAGE_GPU_ONLY);
+      hdrColorImage            = std::move(img);
+      hdrColorImageAllocation  = alloc;
+      hdrColorImageView        = createImageView(hdrColorImage, bloomFmt, vk::ImageAspectFlagBits::eColor);
+    }
+
+    // Bloom mip chain (half-res, quarter-res, …)
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; ++i) {
+      uint32_t mw = std::max(1u, w >> (i + 1));
+      uint32_t mh = std::max(1u, h >> (i + 1));
+      auto [img, alloc] = createVmaImage(mw, mh, bloomFmt,
+        vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+        VMA_MEMORY_USAGE_GPU_ONLY);
+      bloomMips[i].image      = std::move(img);
+      bloomMips[i].allocation = alloc;
+      bloomMips[i].view       = createImageView(bloomMips[i].image, bloomFmt, vk::ImageAspectFlagBits::eColor);
+      bloomMips[i].width      = mw;
+      bloomMips[i].height     = mh;
+      bloomMips[i].layout     = vk::ImageLayout::eUndefined;
+    }
+
+    // --- Linear clamp sampler ---
+    bloomSampler = vk::raii::Sampler(nullptr);
+    vk::SamplerCreateInfo sampCI{
+      .magFilter  = vk::Filter::eLinear,
+      .minFilter  = vk::Filter::eLinear,
+      .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    };
+    bloomSampler = vk::raii::Sampler(device, sampCI);
+
+    // --- Descriptor pool ---
+    // We need BLOOM_MIP_COUNT downsample sets + (BLOOM_MIP_COUNT-1) upsample sets,
+    // each with 2 combined image sampler bindings.
+    uint32_t totalSets = BLOOM_MIP_COUNT + (BLOOM_MIP_COUNT - 1);
+    uint32_t totalSamplers = totalSets * 2;
+    bloomDownsampleSets.clear();
+    bloomUpsampleSets.clear();
+    bloomDescriptorPool = vk::raii::DescriptorPool(nullptr);
+
+    vk::DescriptorPoolSize poolSize{
+      .type            = vk::DescriptorType::eCombinedImageSampler,
+      .descriptorCount = totalSamplers
+    };
+    vk::DescriptorPoolCreateInfo poolCI{
+      .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+      .maxSets       = totalSets,
+      .poolSizeCount = 1,
+      .pPoolSizes    = &poolSize
+    };
+    bloomDescriptorPool = vk::raii::DescriptorPool(device, poolCI);
+
+    // Allocate downsample descriptor sets
+    vk::DescriptorSetLayout dslHandle = *bloomDescriptorSetLayout;
+    std::vector<vk::DescriptorSetLayout> layouts(totalSets, dslHandle);
+    vk::DescriptorSetAllocateInfo dsAllocInfo{
+      .descriptorPool     = *bloomDescriptorPool,
+      .descriptorSetCount = totalSets,
+      .pSetLayouts        = layouts.data()
+    };
+    vk::raii::DescriptorSets allSets(device, dsAllocInfo);
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; ++i)
+      bloomDownsampleSets.push_back(std::move(allSets[i]));
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; ++i)
+      bloomUpsampleSets.push_back(std::move(allSets[BLOOM_MIP_COUNT + i]));
+
+    // Write descriptor sets
+    // Downsample[0]: src = hdrColorImage
+    // Downsample[i>0]: src = bloomMips[i-1]
+    // Upsample[i]: src = bloomMips[i+1], add = bloomMips[i] (higher-res target)
+    auto writeDS = [&](vk::raii::DescriptorSet& ds,
+                       vk::ImageView srcView, vk::ImageView addView) {
+      vk::DescriptorImageInfo srcInfo{
+        .sampler     = *bloomSampler,
+        .imageView   = srcView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::DescriptorImageInfo addInfo{
+        .sampler     = *bloomSampler,
+        .imageView   = addView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {.dstSet=*ds,.dstBinding=0,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&srcInfo},
+        {.dstSet=*ds,.dstBinding=1,.descriptorCount=1,.descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&addInfo}
+      }};
+      device.updateDescriptorSets(writes, {});
+    };
+
+    // Downsample sets: addImage is unused — point it to same src as a placeholder
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT; ++i) {
+      vk::ImageView src = (i == 0) ? *hdrColorImageView : *bloomMips[i-1].view;
+      writeDS(bloomDownsampleSets[i], src, src);
+    }
+    // Upsample sets
+    for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; ++i) {
+      // src = bloomMips[BLOOM_MIP_COUNT-1-i] (finest in chain first)
+      // add = bloomMips[BLOOM_MIP_COUNT-2-i] (next higher resolution)
+      uint32_t coarseMip = (BLOOM_MIP_COUNT - 1) - i;
+      uint32_t fineMip   = (BLOOM_MIP_COUNT - 2) - i;
+      writeDS(bloomUpsampleSets[i], *bloomMips[coarseMip].view, *bloomMips[fineMip].view);
+    }
+
+    std::cout << "[Bloom] Bloom resources created (" << BLOOM_MIP_COUNT << " mips, "
+              << w << "x" << h << ").\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[Bloom] Failed to create bloom resources: " << e.what() << "\n";
+    return false;
+  }
+}
+
+// =============================================================================
+// Histogram auto-exposure resources
+// =============================================================================
+bool Renderer::createExposureResources() {
+  try {
+    // Destroy old resources
+    if (exposureHistogramAlloc != VK_NULL_HANDLE && vmaAllocator != VK_NULL_HANDLE) {
+      vmaDestroyBuffer(vmaAllocator, static_cast<VkBuffer>(*exposureHistogramBuffer), exposureHistogramAlloc);
+      exposureHistogramAlloc = VK_NULL_HANDLE;
+    }
+    exposureHistogramBuffer = vk::raii::Buffer(nullptr);
+
+    if (exposureValueAlloc != VK_NULL_HANDLE && vmaAllocator != VK_NULL_HANDLE) {
+      if (exposureValueMapped) {
+        vmaUnmapMemory(vmaAllocator, exposureValueAlloc);
+        exposureValueMapped = nullptr;
+      }
+      vmaDestroyBuffer(vmaAllocator, static_cast<VkBuffer>(*exposureValueBuffer), exposureValueAlloc);
+      exposureValueAlloc = VK_NULL_HANDLE;
+    }
+    exposureValueBuffer = vk::raii::Buffer(nullptr);
+
+    // 256-bin uint histogram
+    {
+      auto [buf, alloc] = createVmaBuffer(
+        256 * sizeof(uint32_t),
+        vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
+        VMA_MEMORY_USAGE_GPU_ONLY,
+        0);
+      exposureHistogramBuffer = std::move(buf);
+      exposureHistogramAlloc  = alloc;
+    }
+
+    // Single float exposure value (host visible for readback if needed)
+    {
+      auto [buf, alloc] = createVmaBuffer(
+        sizeof(float),
+        vk::BufferUsageFlagBits::eStorageBuffer,
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
+      exposureValueBuffer = std::move(buf);
+      exposureValueAlloc  = alloc;
+
+      // Persistent map
+      vmaMapMemory(vmaAllocator, alloc, &exposureValueMapped);
+      // Initialize exposure to 1.0
+      *static_cast<float*>(exposureValueMapped) = 1.0f;
+    }
+
+    // --- Descriptor pool + set ---
+    exposureDescriptorSet = vk::raii::DescriptorSet(nullptr);
+    exposureDescriptorPool = vk::raii::DescriptorPool(nullptr);
+
+    vk::DescriptorPoolSize poolSizes[2] = {
+      {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1},
+      {.type = vk::DescriptorType::eStorageBuffer,        .descriptorCount = 2}
+    };
+    vk::DescriptorPoolCreateInfo poolCI{
+      .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+      .maxSets       = 1,
+      .poolSizeCount = 2,
+      .pPoolSizes    = poolSizes
+    };
+    exposureDescriptorPool = vk::raii::DescriptorPool(device, poolCI);
+
+    vk::DescriptorSetLayout dslHandle = *exposureDescriptorSetLayout;
+    vk::DescriptorSetAllocateInfo dsAllocInfo{
+      .descriptorPool     = *exposureDescriptorPool,
+      .descriptorSetCount = 1,
+      .pSetLayouts        = &dslHandle
+    };
+    vk::raii::DescriptorSets dsets(device, dsAllocInfo);
+    exposureDescriptorSet = std::move(dsets[0]);
+
+    // Binding 0 (scene color) will be updated at render time with hdrColorImageView.
+    // Bindings 1 and 2 are stable buffers — write them now.
+    vk::DescriptorBufferInfo histInfo{
+      .buffer = *exposureHistogramBuffer,
+      .offset = 0,
+      .range  = VK_WHOLE_SIZE
+    };
+    vk::DescriptorBufferInfo expInfo{
+      .buffer = *exposureValueBuffer,
+      .offset = 0,
+      .range  = VK_WHOLE_SIZE
+    };
+    // Placeholder for binding 0 until hdrColorImage is available
+    vk::DescriptorImageInfo placeholderImg{
+      .sampler     = *defaultTextureResources.textureSampler,
+      .imageView   = *defaultTextureResources.textureImageView,
+      .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+    };
+    std::array<vk::WriteDescriptorSet, 3> writes = {{
+      {.dstSet=*exposureDescriptorSet,.dstBinding=0,.descriptorCount=1,
+       .descriptorType=vk::DescriptorType::eCombinedImageSampler,.pImageInfo=&placeholderImg},
+      {.dstSet=*exposureDescriptorSet,.dstBinding=1,.descriptorCount=1,
+       .descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&histInfo},
+      {.dstSet=*exposureDescriptorSet,.dstBinding=2,.descriptorCount=1,
+       .descriptorType=vk::DescriptorType::eStorageBuffer,.pBufferInfo=&expInfo},
+    }};
+    device.updateDescriptorSets(writes, {});
+
+    std::cout << "[Exposure] Auto-exposure resources created.\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[Exposure] Failed to create exposure resources: " << e.what() << "\n";
+    return false;
+  }
 }

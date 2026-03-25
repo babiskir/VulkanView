@@ -16,17 +16,24 @@
  */
 #pragma once
 
+#include <chrono>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 #include <vulkan/vulkan_raii.hpp>
 
+#include "imgui/imgui.h"
+
 // Forward declarations
 class Renderer;
 class AudioSystem;
 class AudioSource;
+class CameraComponent;
 struct ImGuiContext;
 
 /**
@@ -69,6 +76,13 @@ class ImGuiSystem {
 	 * @param commandBuffer The command buffer to record rendering commands to.
 	 */
     void Render(vk::raii::CommandBuffer& commandBuffer, uint32_t frameIndex);
+
+    /**
+     * @brief End the current ImGui frame without issuing any draw commands.
+     * Call this in early-return paths where Render() cannot be called so that
+     * ImGui::NewFrame() on the next frame does not assert.
+     */
+    void EndFrameOnly() { if (initialized) ImGui::EndFrame(); }
 
     /**
 	 * @brief Handle mouse input.
@@ -124,6 +138,33 @@ class ImGuiSystem {
 	 */
     void SetAudioSystem(AudioSystem* audioSystem);
 
+    /** Set/clear the scene-picker overlay callback (rendered while no scene is loaded). */
+    void SetScenePicker(std::function<void()> cb) { scenePickerCallback = std::move(cb); }
+    void ClearScenePicker() { scenePickerCallback = nullptr; }
+
+    /** Set/clear the per-frame scene UI callback (browser, inspector, etc.).
+     *  Rendered every frame after the scene has loaded. */
+    void SetSceneUI(std::function<void()> cb) { sceneUICallback = std::move(cb); }
+
+    /** Set a callback that renders engine-level settings panels (e.g. simulation controls).
+     *  Registered once by Engine::Initialize; rendered every frame before scene UI. */
+    void SetEngineSettingsCallback(std::function<void()> cb) { engineSettingsCallback = std::move(cb); }
+
+    // -----------------------------------------------------------------------
+    // Panel visibility — toggled from the toolbar / View menu.
+    // Scene-specific UI callbacks should respect these flags.
+    // -----------------------------------------------------------------------
+    struct PanelState {
+        bool showScene      = true;
+        bool showInspector  = true;
+        bool showPerformance= true;
+        bool showAudio      = false;  ///< Hidden by default; re-enable from View menu
+    };
+    PanelState panelState;
+
+    /** Set the active camera so ImGuizmo ViewManipulate can read/write it. */
+    void SetActiveCamera(CameraComponent* cam) { activeCamera = cam; }
+
     /**
 	 * @brief Get the current PBR rendering state.
 	 * @return True if PBR rendering is enabled, false otherwise.
@@ -149,9 +190,34 @@ class ImGuiSystem {
     }
     void SetPBREnabled(bool pbr) {
       pbrEnabled = pbr;
+    }
+
+    // -----------------------------------------------------------------------
+    // Toolbar rendering state (quick-access toggles below menu bar)
+    // -----------------------------------------------------------------------
+    struct ToolbarState {
+        bool showGrid       = false;
+        bool showWireframe  = false;
+        bool showPhysDebug  = false;
+        bool showDebugPanel = true;
     };
+    ToolbarState toolbarState;
+
+    // -----------------------------------------------------------------------
+    // Static debug log — call DebugLog from anywhere to append messages.
+    // Thread-safe; displayed in the "Debug Output" panel each frame.
+    // -----------------------------------------------------------------------
+    static void DebugLog(const std::string& msg);
+    static void DebugLogClear();
 
   private:
+    // Global debug message buffer (static so any translation unit can write to it)
+    static std::deque<std::string> s_debugMessages;
+    static std::mutex              s_debugMutex;
+    static constexpr int           kMaxDebugLines = 200;
+
+    void DrawToolbar();
+    void DrawDebugPanel();
     /**
 	 * @brief Initialize the ImGui system (called by constructor).
 	 * @param renderer Pointer to the renderer.
@@ -212,10 +278,23 @@ class ImGuiSystem {
 
     // Ball-only rendering and camera tracking state
     bool ballOnlyRenderingEnabled = false;
+    std::function<void()> scenePickerCallback;
+    std::function<void()> sceneUICallback;
     bool cameraTrackingEnabled = false;
+
+    std::function<void()> engineSettingsCallback;
 
     // Track if ImGui::Render() was already called in NewFrame() (during loading overlay)
     bool frameAlreadyRendered = false;
+
+    // Active camera for ImGuizmo ViewManipulate
+    CameraComponent* activeCamera = nullptr;
+
+    // Frame-time ring buffer for the profiling window (milliseconds)
+    static constexpr int kFrameHistLen = 128;
+    float frameTimes[kFrameHistLen] = {};
+    int   frameTimeIdx              = 0;
+    std::chrono::steady_clock::time_point lastFrameTimestamp{};
 
     /**
 	 * @brief Create Vulkan resources for ImGui.

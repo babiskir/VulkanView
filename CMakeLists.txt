@@ -73,6 +73,38 @@ endif()
 
 
 
+# ==============================================================================
+# PhysX 5 (static, CPU-only rigid body physics)
+# ==============================================================================
+set(PHYSX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/physx")
+set(PHYSX_INCLUDE_DIR "${PHYSX_SDK_DIR}/include")
+
+set(PHYSX_LIB_DIR "${PHYSX_SDK_DIR}/lib")
+if(UNIX AND NOT APPLE)
+    foreach(_subdir "bin/linux.x86_64/release" "bin/linux.aarch64/release" "release" "")
+        if(EXISTS "${PHYSX_SDK_DIR}/lib/${_subdir}" AND IS_DIRECTORY "${PHYSX_SDK_DIR}/lib/${_subdir}")
+            set(PHYSX_LIB_DIR "${PHYSX_SDK_DIR}/lib/${_subdir}")
+            break()
+        endif()
+    endforeach()
+endif()
+
+set(PHYSX_LIB_NAMES
+    PhysXExtensions_static PhysXCharacterKinematic_static PhysXCooking_static
+    PhysXPvdSDK_static PhysX_static PhysXCommon_static PhysXFoundation_static)
+set(PHYSX_LIBRARIES "")
+foreach(lib ${PHYSX_LIB_NAMES})
+    set(_lp "${PHYSX_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}${lib}${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    if(EXISTS "${_lp}")
+        list(APPEND PHYSX_LIBRARIES "${_lp}")
+    endif()
+endforeach()
+if(PHYSX_LIBRARIES)
+    message(STATUS "PhysX found: ${PHYSX_LIB_DIR}")
+else()
+    message(WARNING "PhysX libraries not found in ${PHYSX_LIB_DIR}")
+endif()
+
 # Platform-specific settings
 if(ANDROID)
     # Android-specific settings
@@ -101,21 +133,6 @@ if(SLANGC_EXECUTABLE)
     # each resulting SPIR-V has exactly one unambiguous "main" entry point.
     # (Having two Fragment entry points both named "main" in one module is invalid SPIR-V.)
 
-    # physics.slang — 4 compute entry points
-    set(PHYSICS_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/physics.slang)
-    set(PHYSICS_ENTRIES IntegrateCS BroadPhaseCS NarrowPhaseCS ResolveCS)
-    foreach(ENTRY ${PHYSICS_ENTRIES})
-        string(TOLOWER ${ENTRY} ENTRY_LOWER)
-        set(PHYSICS_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/physics_${ENTRY_LOWER}.spv)
-        add_custom_command(
-            OUTPUT ${PHYSICS_SPV}
-            COMMAND ${SLANGC_EXECUTABLE} ${PHYSICS_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${PHYSICS_SPV}
-            DEPENDS ${PHYSICS_SHADER}
-            COMMENT "Compiling physics.slang entry ${ENTRY}"
-        )
-        list(APPEND SHADER_SPVS ${PHYSICS_SPV})
-    endforeach()
-
     # pbr.slang — VSMain (vertex) + PSMain (fragment) + GlassPSMain (fragment)
     # Two Fragment entry points cannot share a name in one module.
     set(PBR_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/pbr.slang)
@@ -132,11 +149,85 @@ if(SLANGC_EXECUTABLE)
         list(APPEND SHADER_SPVS ${PBR_SPV})
     endforeach()
 
+    # sky.slang — VSMain (vertex) + PSMain (fragment)
+    set(SKY_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.slang)
+    set(SKY_ENTRIES VSMain PSMain)
+    foreach(ENTRY ${SKY_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(SKY_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/sky_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${SKY_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${SKY_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${SKY_SPV}
+            DEPENDS ${SKY_SHADER}
+            COMMENT "Compiling sky.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${SKY_SPV})
+    endforeach()
+
+    # csm_depth.slang — VSMain (vertex only, depth-only pass)
+    set(CSM_DEPTH_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/csm_depth.slang)
+    set(CSM_DEPTH_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/csm_depth_vsmain.spv)
+    add_custom_command(
+        OUTPUT ${CSM_DEPTH_SPV}
+        COMMAND ${SLANGC_EXECUTABLE} ${CSM_DEPTH_SHADER} -entry VSMain -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${CSM_DEPTH_SPV}
+        DEPENDS ${CSM_DEPTH_SHADER}
+        COMMENT "Compiling csm_depth.slang entry VSMain"
+    )
+    list(APPEND SHADER_SPVS ${CSM_DEPTH_SPV})
+
+    # water.slang — VSMain (vertex) + PSMain (fragment)
+    set(WATER_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/water.slang)
+    set(WATER_ENTRIES VSMain PSMain)
+    foreach(ENTRY ${WATER_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(WATER_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/water_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${WATER_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${WATER_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${WATER_SPV}
+            DEPENDS ${WATER_SHADER}
+            COMMENT "Compiling water.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${WATER_SPV})
+    endforeach()
+
+    # bloom.slang — VSMain (vertex) + DownsamplePS + UpsamplePS + AddPS (fragment)
+    set(BLOOM_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/bloom.slang)
+    set(BLOOM_ENTRIES VSMain DownsamplePS UpsamplePS AddPS)
+    foreach(ENTRY ${BLOOM_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(BLOOM_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/bloom_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${BLOOM_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${BLOOM_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${BLOOM_SPV}
+            DEPENDS ${BLOOM_SHADER}
+            COMMENT "Compiling bloom.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${BLOOM_SPV})
+    endforeach()
+
+    # exposure.slang — BuildHistogramCS + ReduceHistogramCS (compute)
+    set(EXPOSURE_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/shaders/exposure.slang)
+    set(EXPOSURE_ENTRIES BuildHistogramCS ReduceHistogramCS)
+    foreach(ENTRY ${EXPOSURE_ENTRIES})
+        string(TOLOWER ${ENTRY} ENTRY_LOWER)
+        set(EXPOSURE_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/exposure_${ENTRY_LOWER}.spv)
+        add_custom_command(
+            OUTPUT ${EXPOSURE_SPV}
+            COMMAND ${SLANGC_EXECUTABLE} ${EXPOSURE_SHADER} -entry ${ENTRY} -target spirv -profile spirv_1_4 -emit-spirv-directly -o ${EXPOSURE_SPV}
+            DEPENDS ${EXPOSURE_SHADER}
+            COMMENT "Compiling exposure.slang entry ${ENTRY}"
+        )
+        list(APPEND SHADER_SPVS ${EXPOSURE_SPV})
+    endforeach()
+
     # Compile all other Slang shaders (skip per-entry shaders handled above)
     foreach(SHADER ${SLANG_SHADER_SOURCES})
         get_filename_component(SHADER_NAME ${SHADER} NAME)
         get_filename_component(SHADER_NAME_WE ${SHADER_NAME} NAME_WE)
-        if(SHADER_NAME_WE STREQUAL "physics" OR SHADER_NAME_WE STREQUAL "pbr")
+        if(SHADER_NAME_WE STREQUAL "physics" OR SHADER_NAME_WE STREQUAL "pbr"
+                OR SHADER_NAME_WE STREQUAL "sky" OR SHADER_NAME_WE STREQUAL "csm_depth"
+                OR SHADER_NAME_WE STREQUAL "water"
+                OR SHADER_NAME_WE STREQUAL "bloom" OR SHADER_NAME_WE STREQUAL "exposure")
             continue()
         endif()
         string(REGEX REPLACE "\.slang$" "" OUTPUT_NAME ${SHADER_NAME})
@@ -162,6 +253,7 @@ set(SOURCES_COMMON
     # Core
     src/core/engine.cpp
     src/core/platform.cpp
+    src/core/update_publisher.cpp
     # ECS
     src/ecs/entity.cpp
     src/ecs/component.cpp
@@ -177,7 +269,7 @@ set(SOURCES_COMMON
     src/renderer/renderer_utils.cpp
     src/renderer/renderer_resources.cpp
     src/renderer/renderer_ray_query.cpp
-    src/renderer/memory_pool.cpp
+    src/renderer/vma_impl.cpp
     src/renderer/vulkan_device.cpp
     src/renderer/vulkan_dispatch.cpp
     src/renderer/pipeline.cpp
@@ -186,15 +278,28 @@ set(SOURCES_COMMON
     src/scene/scene_loading.cpp
     src/scene/model_loader.cpp
     src/scene/resource_manager.cpp
+    src/scene/tessendorf.cpp
+    src/scene/primitive_meshes.cpp
+    src/scene/physics_scenes.cpp
+    src/scene/scene_factory.cpp
+    src/scene/scene_ui.cpp
+    src/scene/model_manager_scene.cpp
+    src/scene/wave_physics.cpp
+    src/scene/buoyancy_scene.cpp
+    src/scene/spawner_scene.cpp
     # Systems
     src/systems/audio_system.cpp
     src/systems/physics_system.cpp
     src/systems/imgui_system.cpp
+    src/systems/water_system.cpp
     # Debug
     src/debug/renderdoc_debug_system.cpp
     # Third-party
     imgui/imgui.cpp
     imgui/imgui_draw.cpp
+    imgui/imgui_widgets.cpp
+    imgui/imgui_tables.cpp
+    imgui/ImGuizmo.cpp
     third_party/mikktspace/mikktspace.c
 )
 
@@ -224,7 +329,10 @@ target_include_directories(SimpleEngine PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/debug
     ${CMAKE_CURRENT_SOURCE_DIR}/src/utils
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mikktspace
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinyexr
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/vma
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${PHYSX_INCLUDE_DIR}
 )
 
 # Enable required defines for GLM experimental extensions and MSVC math constants
@@ -233,6 +341,7 @@ target_compile_definitions(SimpleEngine PRIVATE
     _USE_MATH_DEFINES
     VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC
+    PX_PHYSX_STATIC_LIB
 )
 
 # Link libraries
@@ -248,6 +357,9 @@ target_link_libraries(SimpleEngine PUBLIC
     glm::glm
     tinygltf::tinygltf
     KTX::ktx
+    fftw3f  # Tessendorf ocean simulation (single-precision FFT)
+    ${PHYSX_LIBRARIES}
+    pthread
 )
 
 if (ANDROID)
@@ -283,6 +395,20 @@ elseif(WIN32)
     )
     # Crash reporter uses Dbghelp for minidump generation
     target_link_libraries(SimpleEngine PRIVATE dbghelp)
+endif()
+
+# Copy HDR environment map if it exists
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/Assets/hdri/farm_field_puresky_4k.exr)
+    if (NOT ANDROID)
+    add_custom_command(TARGET SimpleEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            ${CMAKE_CURRENT_BINARY_DIR}/Assets/hdri
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/Assets/hdri/farm_field_puresky_4k.exr
+            ${CMAKE_CURRENT_BINARY_DIR}/Assets/hdri/farm_field_puresky_4k.exr
+        COMMENT "Copying env map EXR to output directory"
+    )
+    endif()
 endif()
 
 # Copy model and texture files if they exist

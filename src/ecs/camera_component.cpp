@@ -60,34 +60,15 @@ const glm::mat4 &CameraComponent::GetProjectionMatrix()
 void CameraComponent::UpdateViewMatrix()
 {
 	auto transformComponent = owner->GetComponent<TransformComponent>();
-	if (transformComponent)
-	{
-		// Build camera world transform (T * R) from the camera entity's transform
-		// and compute the view matrix as its inverse. This ensures consistency
-		// with rasterization and avoids relying on an external target vector.
-		const glm::vec3 position = transformComponent->GetPosition();
-		const glm::vec3 euler    = transformComponent->GetRotation();        // radians
+	const glm::vec3 position = transformComponent
+	    ? transformComponent->GetPosition()
+	    : glm::vec3(0.0f);
 
-		const glm::quat qx = glm::angleAxis(euler.x, glm::vec3(1.0f, 0.0f, 0.0f));
-		const glm::quat qy = glm::angleAxis(euler.y, glm::vec3(0.0f, 1.0f, 0.0f));
-		const glm::quat qz = glm::angleAxis(euler.z, glm::vec3(0.0f, 0.0f, 1.0f));
-		const glm::quat q  = qz * qy * qx;        // match TransformComponent's ZYX composition
-
-		const glm::mat4 T            = glm::translate(glm::mat4(1.0f), position);
-		const glm::mat4 R            = glm::mat4_cast(q);
-		const glm::mat4 worldNoScale = T * R;
-
-		viewMatrix = glm::inverse(worldNoScale);
-	}
-	else
-	{
-		// Fallback: default camera at origin looking towards +Z with Y up
-		// Note: keep consistent with right-handed convention used elsewhere
-		const glm::vec3 position(0.0f);
-		const glm::vec3 forward(0.0f, 0.0f, 1.0f);
-		const glm::vec3 upVec(0.0f, 1.0f, 0.0f);
-		viewMatrix = glm::lookAt(position, position + forward, upVec);
-	}
+	// Use glm::lookAt with the stored target and up vectors.
+	// This is the intended behaviour: SetTarget()/LookAt() configure where the
+	// camera points, and UpdateViewMatrix() honours that.  The previous
+	// quaternion-from-Euler approach silently ignored the target field.
+	viewMatrix = glm::lookAt(position, target, up);
 	viewMatrixDirty = false;
 }
 

@@ -195,36 +195,55 @@ bool Renderer::createOrResizeForwardPlusBuffers(uint32_t tilesX, uint32_t tilesY
       if (needTiles) {
         if (!!*f.tileHeaders) {
           f.tileHeaders = vk::raii::Buffer(nullptr);
-          f.tileHeadersAlloc.reset();
+          if (f.tileHeadersAlloc) { vmaFreeMemory(vmaAllocator, f.tileHeadersAlloc); f.tileHeadersAlloc = VK_NULL_HANDLE; }
         }
-        auto [buf, alloc] = createBufferPooled(clusters * sizeof(TileHeader), vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        auto [buf, alloc] = createVmaBuffer(clusters * sizeof(TileHeader),
+                                            vk::BufferUsageFlagBits::eStorageBuffer,
+                                            VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
         f.tileHeaders = std::move(buf);
-        f.tileHeadersAlloc = std::move(alloc);
+        f.tileHeadersAlloc = alloc;
         f.tilesCapacity = clusters;
         // Initialize headers to zero so that count==0 when Forward+ is disabled or before first dispatch
-        if (!!f.tileHeadersAlloc && f.tileHeadersAlloc->mappedPtr) {
-          std::memset(f.tileHeadersAlloc->mappedPtr, 0, clusters * sizeof(TileHeader));
+        {
+          VmaAllocationInfo info{};
+          vmaGetAllocationInfo(vmaAllocator, f.tileHeadersAlloc, &info);
+          if (info.pMappedData)
+            std::memset(info.pMappedData, 0, clusters * sizeof(TileHeader));
         }
       }
       if (needIdx) {
         if (!!*f.tileLightIndices) {
           f.tileLightIndices = vk::raii::Buffer(nullptr);
-          f.tileLightIndicesAlloc.reset();
+          if (f.tileLightIndicesAlloc) { vmaFreeMemory(vmaAllocator, f.tileLightIndicesAlloc); f.tileLightIndicesAlloc = VK_NULL_HANDLE; }
         }
-        auto [buf, alloc] = createBufferPooled(indices * sizeof(uint32_t), vk::BufferUsageFlagBits::eStorageBuffer, vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        auto [buf, alloc] = createVmaBuffer(indices * sizeof(uint32_t),
+                                            vk::BufferUsageFlagBits::eStorageBuffer,
+                                            VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
         f.tileLightIndices = std::move(buf);
-        f.tileLightIndicesAlloc = std::move(alloc);
+        f.tileLightIndicesAlloc = alloc;
         f.indicesCapacity = indices;
         // Initialize indices to zero to avoid stray reads
-        if (!!f.tileLightIndicesAlloc && f.tileLightIndicesAlloc->mappedPtr) {
-          std::memset(f.tileLightIndicesAlloc->mappedPtr, 0, indices * sizeof(uint32_t));
+        {
+          VmaAllocationInfo info{};
+          vmaGetAllocationInfo(vmaAllocator, f.tileLightIndicesAlloc, &info);
+          if (info.pMappedData)
+            std::memset(info.pMappedData, 0, indices * sizeof(uint32_t));
         }
       }
       if (!*f.params) {
-        auto [pbuf, palloc] = createBufferPooled(sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 3, vk::BufferUsageFlagBits::eUniformBuffer, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        auto [pbuf, palloc] = createVmaBuffer(sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 3,
+                                              vk::BufferUsageFlagBits::eUniformBuffer,
+                                              VMA_MEMORY_USAGE_CPU_TO_GPU,
+                                              VMA_ALLOCATION_CREATE_MAPPED_BIT);
         f.params = std::move(pbuf);
-        f.paramsAlloc = std::move(palloc);
-        f.paramsMapped = f.paramsAlloc->mappedPtr;
+        f.paramsAlloc = palloc;
+        {
+          VmaAllocationInfo info{};
+          vmaGetAllocationInfo(vmaAllocator, f.paramsAlloc, &info);
+          f.paramsMapped = info.pMappedData;
+        }
       }
 
       // Update compute descriptor set writes for this frame (only if buffers changed or first time)
@@ -342,7 +361,7 @@ void Renderer::updateForwardPlusParams(uint32_t frameIndex, const glm::mat4& vie
   p.counts = glm::uvec4(lightCount, MAX_LIGHTS_PER_TILE, tilesX, tilesY);
   p.zParams = glm::vec4(nearZ, farZ, static_cast<float>(slicesZ), 0.0f);
 
-  std::memcpy(f.paramsAlloc->mappedPtr, &p, sizeof(ParamsCPU));
+  std::memcpy(f.paramsMapped, &p, sizeof(ParamsCPU));
 }
 
 void Renderer::dispatchForwardPlus(vk::raii::CommandBuffer& cmd, uint32_t tilesX, uint32_t tilesY, uint32_t slicesZ) {

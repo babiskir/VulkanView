@@ -17,13 +17,43 @@
 #include "engine.h"
 #include "mesh_component.h"
 #include "scene_loading.h"
+#include "imgui_system.h"
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
+#include <execinfo.h>
 #include <iostream>
 #include <random>
 #include <ranges>
 #include <stdexcept>
+#include <sstream>
+
+// ---------------------------------------------------------------------------
+// Crash signal handler — prints a stack trace so we can see what crashed
+// ---------------------------------------------------------------------------
+static void crashSignalHandler(int sig) {
+    const char* sigName = (sig == SIGSEGV) ? "SIGSEGV" : (sig == SIGABRT) ? "SIGABRT" : "SIGNAL";
+    std::cerr << "\n[CRASH] Signal " << sigName << " (" << sig << ") received!\n";
+    void* frames[64];
+    int n = backtrace(frames, 64);
+    char** syms = backtrace_symbols(frames, n);
+    std::cerr << "Stack trace (" << n << " frames):\n";
+    for (int i = 0; i < n; ++i)
+        std::cerr << "  [" << i << "] " << (syms ? syms[i] : "???") << "\n";
+    free(syms);
+    std::cerr << std::flush;
+    // Re-raise with default handler so we get a core dump
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void installCrashHandlers() {
+    signal(SIGSEGV, crashSignalHandler);
+    signal(SIGABRT, crashSignalHandler);
+    signal(SIGFPE,  crashSignalHandler);
+    signal(SIGILL,  crashSignalHandler);
+}
 
 // This implementation corresponds to the Engine_Architecture chapter in the tutorial:
 // @see en/Building_a_Simple_Engine/Engine_Architecture/02_architectural_patterns.adoc
@@ -112,8 +142,10 @@ bool Engine::Initialize(const std::string& appName, int width, int height, bool 
     // Audio system via constructor
     audioSystem = std::make_unique<AudioSystem>(this, renderer.get());
 
-    // Physics system via constructor (GPU enabled)
-    physicsSystem = std::make_unique<PhysicsSystem>(renderer.get(), true);
+    physicsSystem = std::make_unique<PhysicsSystem>();
+
+    // UpdatePublisher — default 100 Hz fixed step (0.01 s)
+    updatePublisher = std::make_unique<UpdatePublisher>(0.01f);
 
     // ImGui via constructor, then connect audio system
     imguiSystem = std::make_unique<ImGuiSystem>(renderer.get(), width, height);
@@ -123,11 +155,67 @@ bool Engine::Initialize(const std::string& appName, int width, int height, bool 
     return false;
   }
 
+  // Register the "Simulation" settings panel — lets the user adjust the
+  // UpdatePublisher fixed timestep (and see derived Hz) at runtime.
+  imguiSystem->SetEngineSettingsCallback([this]() {
+    if (!updatePublisher) return;
+    ImGui::SetNextWindowSize(ImVec2(300, 130), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Simulation")) {
+      float ts = updatePublisher->GetFixedTimestep();
+      ImGui::TextUnformatted("UpdatePublisher Fixed Timestep");
+      ImGui::Separator();
+      ImGui::Spacing();
+      if (ImGui::SliderFloat("Step (s)", &ts, 0.002f, 0.05f, "%.4f")) {
+        updatePublisher->SetFixedTimestep(ts);
+      }
+      ImGui::Text("  \xe2\x86\x92 %.0f Hz", ts > 0.f ? 1.f / ts : 0.f);
+      ImGui::Spacing();
+      ImGui::TextDisabled("Default: 0.01 s  (100 Hz)");
+    }
+    ImGui::End();
+  });
+
   // Generate ball material properties once at load time
   GenerateBallMaterial();
 
   // Initialize physics scaling system
   InitializePhysicsScaling();
+
+  // ------------------------------------------------------------------
+  // Wire ALL per-frame logic into UpdatePublisher as core subscribers.
+  // These run every frame for the engine's lifetime (not cleared on
+  // ClearScene).  Order within each phase is insertion order.
+  // ------------------------------------------------------------------
+
+  // FixedUpdate — physics at 60 Hz (matches PhysX FIXED_STEP)
+  updatePublisher->SubscribeCoreFixedUpdate([this](float fixedDt) {
+    if (!physicsSystem) return;
+    if (activeCamera)
+      physicsSystem->SetCameraPosition(activeCamera->GetPosition());
+    physicsSystem->Step(fixedDt);
+  });
+
+  // Update — audio system + all active entity updates
+  updatePublisher->SubscribeCoreUpdate([this](float dt) {
+    auto dtMs = std::chrono::milliseconds(static_cast<long long>(dt * 1000.f));
+    if (audioSystem) audioSystem->Update(dtMs);
+
+    std::vector<Entity*> snapshot;
+    {
+      std::shared_lock<std::shared_mutex> lk(entitiesMutex);
+      snapshot.reserve(entities.size());
+      for (auto& uptr : entities) snapshot.push_back(uptr.get());
+    }
+    for (Entity* e : snapshot) {
+      if (e && e->IsActive()) e->Update(dtMs);
+    }
+  });
+
+  // LateUpdate — camera controls (after physics has moved entities)
+  updatePublisher->SubscribeCoreLateUpdate([this](float dt) {
+    if (activeCamera)
+      UpdateCameraControls(std::chrono::milliseconds(static_cast<long long>(dt * 1000.f)));
+  });
 
   initialized = true;
   return true;
@@ -139,6 +227,7 @@ void Engine::Run() {
     throw std::runtime_error("Engine not initialized");
   }
 
+  installCrashHandlers();
   running = true;
 
   // Main loop
@@ -180,6 +269,26 @@ void Engine::Run() {
       lastFPSUpdateFrame = frameCount;
     }
 
+    // Drain any scene loader queued by the picker last frame.
+    // WaitIdle ensures no GPU work is in flight before scene resources are created.
+    if (pendingSceneLoader) {
+      if (renderer) renderer->WaitIdle();
+      auto loader = std::move(pendingSceneLoader);
+      pendingSceneLoader = nullptr;
+      ImGuiSystem::DebugLog("[Engine] Loading scene...");
+      try {
+        loader();
+        ImGuiSystem::DebugLog("[Engine] Scene loaded OK.");
+      } catch (const std::exception& ex) {
+        std::string msg = std::string("[Engine] SCENE LOAD EXCEPTION: ") + ex.what();
+        std::cerr << msg << "\n";
+        ImGuiSystem::DebugLog(msg);
+      } catch (...) {
+        std::cerr << "[Engine] SCENE LOAD UNKNOWN EXCEPTION\n";
+        ImGuiSystem::DebugLog("[Engine] SCENE LOAD UNKNOWN EXCEPTION");
+      }
+    }
+
     // Update
     Update(deltaTimeMs);
 
@@ -202,6 +311,9 @@ void Engine::Cleanup() {
       entityMap.clear();
     }
 
+    // Stop the update loop first so no callbacks fire during teardown
+    updatePublisher.reset();
+
     // Clean up subsystems in reverse order of creation
     imguiSystem.reset();
     physicsSystem.reset();
@@ -212,6 +324,41 @@ void Engine::Cleanup() {
 
     initialized = false;
   }
+}
+
+void Engine::ClearScene() {
+  ImGuiSystem::DebugLog("[Engine] ClearScene() start");
+
+  // Clear scene-level callbacks FIRST so old closures (which capture entity/WaterSystem
+  // pointers) stop firing before we free anything.
+  if (imguiSystem) {
+    imguiSystem->SetSceneUI(nullptr);
+  }
+  if (updatePublisher) {
+    updatePublisher->ClearSceneCallbacks();
+  }
+
+  // Detach waterSystem from renderer so it won't be rendered/updated while we reset.
+  // (The WaterSystem object itself is owned by the scene closure; clearing the UI
+  //  callback releases the closure which destroys the WaterSystem.)
+  if (renderer) {
+    renderer->waterSystem = nullptr;
+  }
+
+  // Remove all entities (releases component resources on the main thread).
+  {
+    std::unique_lock<std::shared_mutex> lk(entitiesMutex);
+    entities.clear();
+    entityMap.clear();
+  }
+  activeCamera = nullptr;
+
+  // Reset the physics scene: removes all actors, recreates a fresh PxScene.
+  if (physicsSystem) {
+    physicsSystem->ClearActors();
+  }
+
+  ImGuiSystem::DebugLog("[Engine] ClearScene() done");
 }
 
 Entity* Engine::CreateEntity(const std::string& name) {
@@ -327,9 +474,15 @@ bool Engine::RemoveEntity(const std::string& name) {
 
 void Engine::SetActiveCamera(CameraComponent* cameraComponent) {
   activeCamera = cameraComponent;
+  if (imguiSystem)
+    imguiSystem->SetActiveCamera(cameraComponent);
 }
 
 const CameraComponent* Engine::GetActiveCamera() const {
+  return activeCamera;
+}
+
+CameraComponent* Engine::GetActiveCamera() {
   return activeCamera;
 }
 
@@ -359,6 +512,35 @@ PhysicsSystem* Engine::GetPhysicsSystem() {
 
 const ImGuiSystem* Engine::GetImGuiSystem() const {
   return imguiSystem.get();
+}
+
+ImGuiSystem* Engine::GetImGuiSystem() {
+  return imguiSystem.get();
+}
+
+// Forward SetScenePicker to ImGuiSystem so the callback is rendered each frame.
+// Override so that calling engine.SetScenePicker() is enough — no need to touch ImGuiSystem directly.
+// (The base storage in engine.h is kept for GetScenePicker() / IsSceneLoaded() checks.)
+void Engine::SetScenePicker(std::function<void()> callback) {
+  scenePickerUI = callback;
+  if (imguiSystem) {
+    imguiSystem->SetScenePicker(callback);
+  }
+}
+
+void Engine::SetSceneUI(std::function<void()> callback) {
+  if (imguiSystem)
+    imguiSystem->SetSceneUI(std::move(callback));
+}
+
+void Engine::SubscribeSceneFixedUpdate(std::function<void(float)> cb) {
+  if (updatePublisher) updatePublisher->SubscribeSceneFixedUpdate(std::move(cb));
+}
+void Engine::SubscribeSceneUpdate(std::function<void(float)> cb) {
+  if (updatePublisher) updatePublisher->SubscribeSceneUpdate(std::move(cb));
+}
+void Engine::SubscribeSceneLateUpdate(std::function<void(float)> cb) {
+  if (updatePublisher) updatePublisher->SubscribeSceneLateUpdate(std::move(cb));
 }
 
 void Engine::handleMouseInput(float x, float y, uint32_t buttons) {
@@ -473,72 +655,36 @@ void Engine::handleKeyInput(uint32_t key, bool pressed) {
 }
 
 void Engine::Update(TimeDelta deltaTime) {
-  // Apply any entity removals requested by background threads.
+  // Drain entity removals queued from background threads.
   ProcessPendingEntityRemovals();
 
-  // During background scene loading we avoid touching the live entity
-  // list from the main thread. This lets the loading thread construct
-  // entities/components safely while the main thread only drives the
-  // UI/loading overlay.
-  if (renderer&& renderer
-  
-  ->
-  IsLoading()
-  ) {
-    if (imguiSystem) {
-      imguiSystem->NewFrame();
-    }
+  // While a scene is being loaded on a background thread, only drive the
+  // loading overlay — skip all game-logic updates.
+  if (renderer && renderer->IsLoading()) {
+    if (imguiSystem) imguiSystem->NewFrame();
     return;
   }
 
-  // Process pending ball creations (outside rendering loop to avoid memory pool constraints)
+  // Create any balls requested this frame before the physics step fires.
   ProcessPendingBalls();
 
-  if (activeCamera) {
-    glm::vec3 currentCameraPosition = activeCamera->GetPosition();
-    physicsSystem->SetCameraPosition(currentCameraPosition);
-  }
+  // UpdatePublisher is the single source of truth for all per-frame logic:
+  //   CoreFixedUpdate  → physicsSystem->Step()  (60 Hz)
+  //   CoreUpdate       → audioSystem, entity updates
+  //   CoreLateUpdate   → camera controls
+  //   SceneFixedUpdate → buoyancy forces, scene-specific fixed logic
+  //   SceneUpdate      → scene per-frame logic
+  //   SceneLateUpdate  → scene post-update logic
+  if (updatePublisher)
+    updatePublisher->TickWithDt(deltaTime.count() * 0.001f);
 
-  // Use real deltaTime for physics to maintain proper timing
-  physicsSystem->Update(deltaTime);
-
-  // Update audio system
-  audioSystem->Update(deltaTime);
-
-  // Update ImGui system
-  imguiSystem->NewFrame();
-
-  // Update camera controls
-  if (activeCamera) {
-    UpdateCameraControls(deltaTime);
-  }
-
-  // Update all entities.
-  // Do not hold `entitiesMutex` while calling `Entity::Update()`.
-  // Background threads may need the unique lock to add entities during loading,
-  // and holding a shared lock for a long time can starve them.
-  std::vector<Entity *> snapshot; {
-    std::shared_lock<std::shared_mutex> lk(entitiesMutex);
-    snapshot.reserve(entities.size());
-    for (auto& uptr : entities) {
-      snapshot.push_back(uptr.get());
-    }
-  }
-  for (Entity* entity : snapshot) {
-    if (!entity || !entity->IsActive())
-      continue;
-    entity->Update(deltaTime);
-  }
+  // ImGui new-frame must happen after all logic updates and before Render().
+  if (imguiSystem) imguiSystem->NewFrame();
 }
 
 void Engine::Render() {
   // Ensure renderer is ready
   if (!renderer || !renderer->IsInitialized()) {
-    return;
-  }
-
-  // Check if we have an active camera
-  if (!activeCamera) {
     return;
   }
 
@@ -997,8 +1143,7 @@ bool Engine::InitializeAndroid(android_app* app, const std::string& appName, boo
     // Audio system via constructor
     audioSystem = std::make_unique<AudioSystem>(this, renderer.get());
 
-    // Physics system via constructor (GPU enabled)
-    physicsSystem = std::make_unique<PhysicsSystem>(renderer.get(), true);
+    physicsSystem = std::make_unique<PhysicsSystem>();
 
     // ImGui via constructor, then connect audio system
     imguiSystem = std::make_unique<ImGuiSystem>(renderer.get(), width, height);

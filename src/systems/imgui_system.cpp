@@ -16,12 +16,361 @@
  */
 #include "imgui_system.h"
 #include "audio_system.h"
+#include "camera_component.h"
 #include "renderer.h"
+#include "renderdoc_debug_system.h"
+#include "transform_component.h"
 
 // Include ImGui headers
 #include "imgui/imgui.h"
+#include "imgui/imgui_internal.h"   // DockBuilder API
+#include "imgui/ImGuizmo.h"
 
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+
+#include <algorithm>
+#include <chrono>
 #include <iostream>
+#include <sstream>
+
+// ---------------------------------------------------------------------------
+// Static debug log storage
+// ---------------------------------------------------------------------------
+std::deque<std::string> ImGuiSystem::s_debugMessages;
+std::mutex              ImGuiSystem::s_debugMutex;
+
+void ImGuiSystem::DebugLog(const std::string& msg) {
+    // Also echo to stderr for terminal viewing
+    std::cerr << "[DBG] " << msg << "\n";
+    std::lock_guard<std::mutex> lk(s_debugMutex);
+    // Timestamp
+    auto now  = std::chrono::system_clock::now();
+    auto t    = std::chrono::system_clock::to_time_t(now);
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", std::localtime(&t));
+    s_debugMessages.push_back(std::string(buf) + "  " + msg);
+    while ((int)s_debugMessages.size() > kMaxDebugLines)
+        s_debugMessages.pop_front();
+}
+
+void ImGuiSystem::DebugLogClear() {
+    std::lock_guard<std::mutex> lk(s_debugMutex);
+    s_debugMessages.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Engine visual style — close match to nvpro-samples/vk_gltf_renderer
+// Palette: near-black bg (#0E0F11), dark-slate panels (#161820),
+//          blue accent (#4D9FD6 / 0.302,0.624,0.839), warm text (#E8E8EA)
+// ---------------------------------------------------------------------------
+static void ApplyEngineStyle()
+{
+    ImGuiStyle& s = ImGui::GetStyle();
+
+    // ---- Shape ----
+    s.WindowRounding     = 2.f;
+    s.ChildRounding      = 2.f;
+    s.FrameRounding      = 2.f;
+    s.PopupRounding      = 2.f;
+    s.ScrollbarRounding  = 2.f;
+    s.GrabRounding       = 2.f;
+    s.TabRounding        = 2.f;
+
+    // ---- Sizing ----
+    s.WindowPadding      = ImVec2(8.f,  6.f);
+    s.FramePadding       = ImVec2(5.f,  3.f);
+    s.CellPadding        = ImVec2(4.f,  2.f);
+    s.ItemSpacing        = ImVec2(6.f,  3.f);
+    s.ItemInnerSpacing   = ImVec2(4.f,  4.f);
+    s.IndentSpacing      = 14.f;
+    s.ScrollbarSize      = 11.f;
+    s.GrabMinSize        = 8.f;
+    s.TabBarBorderSize   = 1.f;
+
+    // ---- Borders ----
+    s.WindowBorderSize   = 1.f;
+    s.ChildBorderSize    = 0.f;
+    s.PopupBorderSize    = 1.f;
+    s.FrameBorderSize    = 0.f;
+
+    ImVec4* c = s.Colors;
+
+    // ---- Base surfaces (dark slate) ----
+    c[ImGuiCol_WindowBg]           = ImVec4(0.086f, 0.090f, 0.102f, 1.00f);  // #16171A
+    c[ImGuiCol_ChildBg]            = ImVec4(0.071f, 0.075f, 0.086f, 1.00f);  // #121316
+    c[ImGuiCol_PopupBg]            = ImVec4(0.086f, 0.090f, 0.102f, 0.98f);
+    c[ImGuiCol_Border]             = ImVec4(0.200f, 0.208f, 0.235f, 0.80f);
+    c[ImGuiCol_BorderShadow]       = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
+
+    // ---- Text ----
+    c[ImGuiCol_Text]               = ImVec4(0.910f, 0.910f, 0.918f, 1.00f);  // #E8E8EA
+    c[ImGuiCol_TextDisabled]       = ImVec4(0.420f, 0.430f, 0.460f, 1.00f);
+
+    // ---- Frames (inputs, sliders, checkboxes) ----
+    c[ImGuiCol_FrameBg]            = ImVec4(0.141f, 0.149f, 0.169f, 1.00f);  // #242630
+    c[ImGuiCol_FrameBgHovered]     = ImVec4(0.192f, 0.200f, 0.224f, 1.00f);
+    c[ImGuiCol_FrameBgActive]      = ImVec4(0.220f, 0.360f, 0.520f, 0.60f);
+
+    // ---- Title bars ----
+    c[ImGuiCol_TitleBg]            = ImVec4(0.059f, 0.063f, 0.075f, 1.00f);  // #0F1013
+    c[ImGuiCol_TitleBgActive]      = ImVec4(0.071f, 0.078f, 0.094f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]   = ImVec4(0.059f, 0.063f, 0.075f, 0.80f);
+
+    // ---- Menu bar ----
+    c[ImGuiCol_MenuBarBg]          = ImVec4(0.055f, 0.059f, 0.071f, 1.00f);  // #0E0F12
+
+    // ---- Scrollbar ----
+    c[ImGuiCol_ScrollbarBg]        = ImVec4(0.039f, 0.039f, 0.047f, 0.00f);
+    c[ImGuiCol_ScrollbarGrab]      = ImVec4(0.220f, 0.231f, 0.259f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabHovered]= ImVec4(0.302f, 0.318f, 0.357f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.400f, 0.420f, 0.471f, 1.00f);
+
+    // ---- Accent: blue (#4D9FD6 ≈ 0.302,0.624,0.839) ----
+    const ImVec4 accent      = ImVec4(0.302f, 0.624f, 0.839f, 1.00f);
+    const ImVec4 accentDim   = ImVec4(0.200f, 0.490f, 0.700f, 1.00f);
+    const ImVec4 accentFaint = ImVec4(0.200f, 0.420f, 0.620f, 0.40f);
+
+    // ---- Checkboxes, sliders ----
+    c[ImGuiCol_CheckMark]          = accent;
+    c[ImGuiCol_SliderGrab]         = accentDim;
+    c[ImGuiCol_SliderGrabActive]   = accent;
+
+    // ---- Buttons ----
+    c[ImGuiCol_Button]             = ImVec4(0.157f, 0.165f, 0.188f, 1.00f);
+    c[ImGuiCol_ButtonHovered]      = ImVec4(0.220f, 0.376f, 0.569f, 1.00f);
+    c[ImGuiCol_ButtonActive]       = ImVec4(0.157f, 0.329f, 0.541f, 1.00f);
+
+    // ---- Headers (CollapsingHeader, Selectable) ----
+    c[ImGuiCol_Header]             = ImVec4(0.180f, 0.329f, 0.510f, 0.40f);
+    c[ImGuiCol_HeaderHovered]      = ImVec4(0.220f, 0.400f, 0.612f, 0.80f);
+    c[ImGuiCol_HeaderActive]       = ImVec4(0.220f, 0.400f, 0.612f, 1.00f);
+
+    // ---- Separators ----
+    c[ImGuiCol_Separator]          = ImVec4(0.200f, 0.208f, 0.235f, 0.80f);
+    c[ImGuiCol_SeparatorHovered]   = accentDim;
+    c[ImGuiCol_SeparatorActive]    = accent;
+
+    // ---- Resize grips ----
+    c[ImGuiCol_ResizeGrip]         = accentFaint;
+    c[ImGuiCol_ResizeGripHovered]  = ImVec4(0.302f, 0.624f, 0.839f, 0.67f);
+    c[ImGuiCol_ResizeGripActive]   = ImVec4(0.302f, 0.624f, 0.839f, 0.95f);
+
+    // ---- Tabs ----
+    c[ImGuiCol_Tab]                = ImVec4(0.110f, 0.118f, 0.137f, 1.00f);
+    c[ImGuiCol_TabHovered]         = ImVec4(0.220f, 0.376f, 0.569f, 0.80f);
+    c[ImGuiCol_TabActive]          = ImVec4(0.160f, 0.310f, 0.490f, 1.00f);
+    c[ImGuiCol_TabUnfocused]       = ImVec4(0.090f, 0.094f, 0.110f, 1.00f);
+    c[ImGuiCol_TabUnfocusedActive] = ImVec4(0.130f, 0.220f, 0.345f, 1.00f);
+
+    // ---- Docking ----
+    c[ImGuiCol_DockingPreview]     = ImVec4(0.302f, 0.624f, 0.839f, 0.70f);
+    c[ImGuiCol_DockingEmptyBg]     = ImVec4(0.059f, 0.063f, 0.075f, 1.00f);
+
+    // ---- Plot ----
+    c[ImGuiCol_PlotLines]          = ImVec4(0.549f, 0.620f, 0.710f, 1.00f);
+    c[ImGuiCol_PlotLinesHovered]   = ImVec4(0.960f, 0.510f, 0.180f, 1.00f);
+    c[ImGuiCol_PlotHistogram]      = accentDim;
+    c[ImGuiCol_PlotHistogramHovered]= accent;
+
+    // ---- Tables ----
+    c[ImGuiCol_TableHeaderBg]      = ImVec4(0.110f, 0.118f, 0.137f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]  = ImVec4(0.200f, 0.208f, 0.235f, 1.00f);
+    c[ImGuiCol_TableBorderLight]   = ImVec4(0.149f, 0.157f, 0.176f, 1.00f);
+    c[ImGuiCol_TableRowBg]         = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
+    c[ImGuiCol_TableRowBgAlt]      = ImVec4(1.000f, 1.000f, 1.000f, 0.03f);
+
+    // ---- Misc ----
+    c[ImGuiCol_TextSelectedBg]     = ImVec4(0.302f, 0.624f, 0.839f, 0.35f);
+    c[ImGuiCol_DragDropTarget]     = ImVec4(1.000f, 0.800f, 0.000f, 0.90f);
+    c[ImGuiCol_NavHighlight]       = accent;
+    c[ImGuiCol_NavWindowingHighlight]= ImVec4(1.f, 1.f, 1.f, 0.70f);
+    c[ImGuiCol_NavWindowingDimBg]  = ImVec4(0.8f, 0.8f, 0.8f, 0.20f);
+    c[ImGuiCol_ModalWindowDimBg]   = ImVec4(0.06f, 0.06f, 0.08f, 0.60f);
+}
+
+// ---------------------------------------------------------------------------
+// Initial dock layout — called once when no saved layout exists.
+// Arranges the built-in panels around the 3D viewport.
+// ---------------------------------------------------------------------------
+static void BuildInitialDockLayout(ImGuiID dockID)
+{
+    ImVec2 size = ImGui::GetMainViewport()->WorkSize;
+
+    ImGui::DockBuilderRemoveNode(dockID);
+    ImGui::DockBuilderAddNode(dockID, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(dockID, size);
+
+    // ┌────────────────────────────────┬──────────────────┐
+    // │                                │  Scene Browser   │
+    // │        3D Viewport             ├──────────────────┤
+    // │        (pass-through)          │  Inspector       │
+    // ├───────────────────────┬────────┴──────────────────┤
+    // │   Debug Output        │  Performance   │  Audio   │
+    // └────────────────────────────────────────────────────┘
+
+    ImGuiID rightID, centerID;
+    ImGui::DockBuilderSplitNode(dockID, ImGuiDir_Right, 0.26f, &rightID, &centerID);
+
+    ImGuiID rightTopID, rightBotID;
+    ImGui::DockBuilderSplitNode(rightID, ImGuiDir_Down, 0.50f, &rightBotID, &rightTopID);
+
+    ImGuiID bottomID, viewportID;
+    ImGui::DockBuilderSplitNode(centerID, ImGuiDir_Down, 0.22f, &bottomID, &viewportID);
+
+    ImGui::DockBuilderDockWindow("Scene",               rightTopID);
+    ImGui::DockBuilderDockWindow("Loaded Models",       rightTopID);
+    ImGui::DockBuilderDockWindow("Inspector",           rightBotID);
+    ImGui::DockBuilderDockWindow("Performance",         bottomID);
+    ImGui::DockBuilderDockWindow("Debug Output",        bottomID);
+    ImGui::DockBuilderDockWindow("HRTF Audio Controls", bottomID);
+    ImGui::DockBuilderDockWindow("Object Spawner",      rightTopID);
+    ImGui::DockBuilderDockWindow("Ocean Environment",   rightBotID);
+
+    ImGui::DockBuilderFinish(dockID);
+}
+
+// ---------------------------------------------------------------------------
+// DrawToolbar — vk_gltf_renderer–style icon/toggle bar below the menu bar
+// ---------------------------------------------------------------------------
+void ImGuiSystem::DrawToolbar()
+{
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Position just below the menu bar
+    const float menuBarH = ImGui::GetFrameHeight();
+    ImGui::SetNextWindowPos(ImVec2(0, menuBarH), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.x, 32.f), ImGuiCond_Always);
+
+    ImGuiWindowFlags tbFlags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize  |
+        ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoScrollbar|
+        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNav;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 4.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 0.f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.059f, 0.063f, 0.075f, 1.f));
+
+    if (ImGui::Begin("##Toolbar", nullptr, tbFlags)) {
+        // Helper: toggled button with highlight when active
+        auto ToggleBtn = [&](const char* label, bool& state, const char* tip = nullptr) {
+            if (state) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.16f,0.31f,0.49f,1.f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f,0.40f,0.61f,1.f));
+            }
+            if (ImGui::Button(label, ImVec2(0, 22.f))) state = !state;
+            if (state) ImGui::PopStyleColor(2);
+            if (tip && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tip);
+        };
+
+        // ---- PBR shading ----
+        ToggleBtn(pbrEnabled ? "PBR" : "Flat", pbrEnabled, "Toggle PBR / flat shading");
+        ImGui::SameLine();
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::SameLine();
+
+        // ---- Viewport toggles ----
+        ToggleBtn("Grid",      toolbarState.showGrid,      "Toggle ground grid");
+        ImGui::SameLine();
+        ToggleBtn("Wire",      toolbarState.showWireframe, "Toggle wireframe overlay");
+        ImGui::SameLine();
+        ToggleBtn("PhysDbg",   toolbarState.showPhysDebug, "Toggle physics debug shapes");
+        ImGui::SameLine();
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::SameLine();
+
+        // ---- Debug output panel ----
+        ToggleBtn("Log", toolbarState.showDebugPanel, "Toggle debug log panel");
+        ImGui::SameLine();
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::SameLine();
+
+        // ---- RenderDoc ----
+        auto& rdoc = RenderDocDebugSystem::GetInstance();
+        if (rdoc.IsAvailable()) {
+            if (ImGui::Button("RDC", ImVec2(0, 22.f)))
+                rdoc.TriggerCapture();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Trigger RenderDoc frame capture");
+            ImGui::SameLine();
+        }
+
+        // ---- Right-aligned frame stats ----
+        if (renderer) {
+            char statsText[64];
+            const uint32_t upTot  = renderer->GetUploadJobsTotal();
+            const uint32_t upDone = renderer->GetUploadJobsCompleted();
+            if (upTot > 0 && upDone < upTot)
+                std::snprintf(statsText, sizeof(statsText), "Streaming %u/%u tex", upDone, upTot);
+            else
+                std::snprintf(statsText, sizeof(statsText), "");
+
+            if (statsText[0]) {
+                float tw = ImGui::CalcTextSize(statsText).x + 10.f;
+                ImGui::SetCursorPosX(io.DisplaySize.x - tw);
+                ImGui::TextDisabled("%s", statsText);
+            }
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(4);
+}
+
+// ---------------------------------------------------------------------------
+// DrawDebugPanel — scrollable log window (dockable at bottom)
+// ---------------------------------------------------------------------------
+void ImGuiSystem::DrawDebugPanel()
+{
+    if (!toolbarState.showDebugPanel) return;
+
+    ImGui::SetNextWindowSize(ImVec2(600, 180), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Debug Output", &toolbarState.showDebugPanel)) {
+        // Buttons row
+        if (ImGui::SmallButton("Clear")) DebugLogClear();
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%d lines)", (int)s_debugMessages.size());
+        ImGui::SameLine();
+        static bool autoScroll = true;
+        ImGui::Checkbox("Auto-scroll", &autoScroll);
+
+        ImGui::Separator();
+
+        // Message list
+        ImGui::BeginChild("##DebugLog", ImVec2(0, 0), false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        {
+            std::lock_guard<std::mutex> lk(s_debugMutex);
+            for (const auto& line : s_debugMessages) {
+                // Colour-code errors and warnings
+                bool isErr  = (line.find("ERROR")   != std::string::npos ||
+                               line.find("CRASH")   != std::string::npos ||
+                               line.find("EXCEPTION")!= std::string::npos);
+                bool isWarn = (line.find("WARNING") != std::string::npos ||
+                               line.find("WARN")    != std::string::npos ||
+                               line.find("failed")  != std::string::npos ||
+                               line.find("Failed")  != std::string::npos);
+                if (isErr)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.35f, 0.35f, 1.f));
+                else if (isWarn)
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.80f, 0.20f, 1.f));
+
+                ImGui::TextUnformatted(line.c_str());
+
+                if (isErr || isWarn)
+                    ImGui::PopStyleColor();
+            }
+            if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.f)
+                ImGui::SetScrollHereY(1.f);
+        }
+        ImGui::EndChild();
+    }
+    ImGui::End();
+}
 
 // This implementation corresponds to the GUI chapter in the tutorial:
 // @see en/Building_a_Simple_Engine/GUI/02_imgui_setup.adoc
@@ -53,12 +402,13 @@ bool ImGuiSystem::Initialize(Renderer* renderer, uint32_t width, uint32_t height
 
   // Configure ImGui
   ImGuiIO& io = ImGui::GetIO();
+  io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
   // Set display size
   io.DisplaySize = ImVec2(static_cast<float>(width), static_cast<float>(height));
   io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
   // Set up ImGui style
-  ImGui::StyleColorsDark();
+  ApplyEngineStyle();
 
   // Create Vulkan resources
   if (!createResources()) {
@@ -144,7 +494,19 @@ void ImGuiSystem::NewFrame() {
   // Reset the flag at the start of each frame
   frameAlreadyRendered = false;
 
+  // Track frame time for the profiling window
+  {
+    auto now = std::chrono::steady_clock::now();
+    if (lastFrameTimestamp.time_since_epoch().count() != 0) {
+      float ms = std::chrono::duration<float, std::milli>(now - lastFrameTimestamp).count();
+      frameTimes[frameTimeIdx] = ms;
+      frameTimeIdx = (frameTimeIdx + 1) % kFrameHistLen;
+    }
+    lastFrameTimestamp = now;
+  }
+
   ImGui::NewFrame();
+  ImGuizmo::BeginFrame();
 
   // Loading overlay: show a fullscreen progress bar while the initial scene is loading.
   // The bar resets between phases (Textures -> Physics -> AS -> Finalizing) so users
@@ -210,6 +572,87 @@ void ImGuiSystem::NewFrame() {
       ImGui::End();
       return;
     }
+  }
+
+  // --- Scene picker overlay (shown until a scene is chosen) ---
+  if (scenePickerCallback && (!renderer || !renderer->IsLoading())) {
+    scenePickerCallback();
+    // Don't render the normal editor UI while picker is up; still allow render to flush.
+    return;
+  }
+
+  // --- Main menu bar (File / View / Render / Debug) ---
+  if (ImGui::BeginMainMenuBar()) {
+    if (ImGui::BeginMenu("File")) {
+      if (ImGui::MenuItem("Exit", "Alt+F4")) { /* handled by OS */ }
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("View")) {
+      ImGui::MenuItem("Scene Browser",  nullptr, &panelState.showScene);
+      ImGui::MenuItem("Inspector",      nullptr, &panelState.showInspector);
+      ImGui::MenuItem("Performance",    nullptr, &panelState.showPerformance);
+      ImGui::MenuItem("Audio Controls", nullptr, &panelState.showAudio);
+      ImGui::Separator();
+      ImGui::MenuItem("Debug Log",      nullptr, &toolbarState.showDebugPanel);
+      ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Render")) {
+      ImGui::MenuItem("PBR Shading",   nullptr, &pbrEnabled);
+      ImGui::Separator();
+      ImGui::MenuItem("Wireframe",     nullptr, &toolbarState.showWireframe);
+      ImGui::MenuItem("Ground Grid",   nullptr, &toolbarState.showGrid);
+      ImGui::MenuItem("Physics Debug", nullptr, &toolbarState.showPhysDebug);
+      ImGui::EndMenu();
+    }
+    // Right-aligned: engine name + mode
+    {
+      const char* modeLabel = pbrEnabled ? "  PBR  " : "  Flat  ";
+      float x = ImGui::GetContentRegionMax().x
+              - ImGui::CalcTextSize("VulkanView Engine").x
+              - ImGui::CalcTextSize(modeLabel).x - 20.f;
+      ImGui::SetCursorPosX(x);
+      ImGui::TextDisabled("VulkanView Engine");
+      ImGui::SameLine();
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.302f, 0.624f, 0.839f, 1.f));
+      ImGui::Text("%s", modeLabel);
+      ImGui::PopStyleColor();
+    }
+    ImGui::EndMainMenuBar();
+  }
+
+  // --- Toolbar (row of icon buttons just below the menu bar) ---
+  DrawToolbar();
+
+  // --- Full-screen DockSpace host window ---
+  // Covers the area below menu bar + toolbar.
+  {
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float toolbarH = 32.f;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x, viewport->WorkPos.y + toolbarH));
+    ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x, viewport->WorkSize.y - toolbarH));
+    ImGui::SetNextWindowViewport(viewport->ID);
+    ImGuiWindowFlags hostFlags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize   | ImGuiWindowFlags_NoMove      |
+        ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoNavFocus |
+        ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDocking;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin("##DockSpaceHost", nullptr, hostFlags);
+    ImGui::PopStyleVar(3);
+    ImGuiID dockID = ImGui::GetID("MainDockSpace");
+    // Rebuild the default panel arrangement once per session.  Using a static bool (not
+    // DockBuilderGetNode == nullptr) ensures the layout is applied even when an old imgui.ini
+    // exists that might place panels outside the viewport.
+    static bool layoutInitialized = false;
+    if (!layoutInitialized) {
+      BuildInitialDockLayout(dockID);
+      layoutInitialized = true;
+    }
+    ImGui::DockSpace(dockID, ImVec2(0.0f, 0.0f),
+                     ImGuiDockNodeFlags_PassthruCentralNode);
+    ImGui::End();
   }
 
   // --- Streaming status: small progress indicator in the upper-right ---
@@ -291,8 +734,93 @@ void ImGuiSystem::NewFrame() {
     }
   }
 
+  // --- Profiling window ---
+  if (panelState.showPerformance) {
+    // Compute stats from the ring buffer
+    float sumMs = 0.f, minMs = FLT_MAX, maxMs = 0.f;
+    int   validCount = 0;
+    for (int i = 0; i < kFrameHistLen; ++i) {
+      if (frameTimes[i] > 0.f) {
+        sumMs += frameTimes[i];
+        minMs  = std::min(minMs, frameTimes[i]);
+        maxMs  = std::max(maxMs, frameTimes[i]);
+        ++validCount;
+      }
+    }
+    float avgMs  = (validCount > 0) ? sumMs / static_cast<float>(validCount) : 0.f;
+    float curFps = (avgMs > 0.f) ? 1000.f / avgMs : 0.f;
+
+    ImGui::SetNextWindowSize(ImVec2(300, 160), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Performance", &panelState.showPerformance)) {
+      ImGui::Text("FPS: %.1f  |  Frame: %.2f ms", curFps, avgMs);
+      ImGui::Text("Min: %.2f ms  Max: %.2f ms", minMs, maxMs);
+
+      // Build a display buffer ordered oldest → newest
+      float display[kFrameHistLen];
+      for (int i = 0; i < kFrameHistLen; ++i)
+        display[i] = frameTimes[(frameTimeIdx + i) % kFrameHistLen];
+
+      char overlay[32];
+      std::snprintf(overlay, sizeof(overlay), "%.1f fps", curFps);
+      ImGui::PlotLines("##ft", display, kFrameHistLen, 0, overlay,
+                       0.f, maxMs > 0.f ? maxMs * 1.5f : 50.f,
+                       ImVec2(-1, 60));
+
+      ImGui::Separator();
+      auto& rdoc = RenderDocDebugSystem::GetInstance();
+      if (rdoc.IsAvailable()) {
+        if (ImGui::Button("Capture Frame (RenderDoc)")) {
+          rdoc.TriggerCapture();
+        }
+      } else {
+        ImGui::TextDisabled("RenderDoc not attached");
+      }
+    }
+    ImGui::End();
+  } // if panelState.showPerformance
+
+  // --- ImGuizmo ViewManipulate (axis-alignment gizmo in lower-right corner) ---
+  if (activeCamera) {
+    ImGuiIO& io = ImGui::GetIO();
+    const float gizmoSize = 128.f;
+    const float gizmoX    = io.DisplaySize.x - gizmoSize - 10.f;
+    const float gizmoY    = io.DisplaySize.y - gizmoSize - 10.f;
+
+    ImGuizmo::SetRect(0, 0, io.DisplaySize.x, io.DisplaySize.y);
+
+    glm::mat4 viewMat = activeCamera->GetViewMatrix();
+    float viewArr[16];
+    memcpy(viewArr, glm::value_ptr(viewMat), sizeof(viewArr));
+
+    glm::vec3 camPos = activeCamera->GetPosition();
+    glm::vec3 camTgt = activeCamera->GetTarget();
+    float camDist    = glm::length(camTgt - camPos);
+    if (camDist < 0.001f) camDist = 1.f;
+
+    ImGuizmo::ViewManipulate(viewArr, camDist,
+                             ImVec2(gizmoX, gizmoY),
+                             ImVec2(gizmoSize, gizmoSize),
+                             0x10101080u);
+
+    // If ViewManipulate changed the matrix, update the camera
+    glm::mat4 newView;
+    memcpy(glm::value_ptr(newView), viewArr, sizeof(viewArr));
+    if (newView != viewMat) {
+      glm::mat4 invView = glm::inverse(newView);
+      glm::vec3 newPos  = glm::vec3(invView[3]);
+      // Camera forward is -Z column of the inverse view matrix
+      glm::vec3 forward = glm::normalize(-glm::vec3(invView[2]));
+      glm::vec3 newTgt  = newPos + forward * camDist;
+
+      auto* transform = activeCamera->GetOwner()->GetComponent<TransformComponent>();
+      if (transform) transform->SetPosition(newPos);
+      activeCamera->LookAt(newTgt);
+    }
+  }
+
   // Create HRTF Audio Control UI
-  ImGui::Begin("HRTF Audio Controls");
+  if (panelState.showAudio) {
+  ImGui::Begin("HRTF Audio Controls", &panelState.showAudio);
   ImGui::Text("3D Audio Position Control");
 
   // Audio source selection
@@ -472,6 +1000,18 @@ void ImGuiSystem::NewFrame() {
   }
 
   ImGui::End();
+  } // if panelState.showAudio
+
+  // --- Debug output panel ---
+  DrawDebugPanel();
+
+  // --- Engine-level settings panels (simulation, UpdatePublisher controls, etc.) ---
+  if (engineSettingsCallback)
+    engineSettingsCallback();
+
+  // --- Scene-specific UI panels (browser, inspector, etc.) ---
+  if (sceneUICallback)
+    sceneUICallback();
 }
 
 void ImGuiSystem::Render(vk::raii::CommandBuffer& commandBuffer, uint32_t frameIndex) {
@@ -576,17 +1116,53 @@ void ImGuiSystem::HandleKeyboard(uint32_t key, bool pressed) {
 
   ImGuiIO& io = ImGui::GetIO();
 
-  // Update key state
-  if (key < 512) {
-    io.KeysDown[key] = pressed;
-  }
+  // ImGui 1.87+ replaced KeysDown[] with AddKeyEvent().
+  // Map a subset of GLFW key codes to ImGuiKey values.
+  auto glfwToImGuiKey = [](uint32_t k) -> ImGuiKey {
+    // Printable ASCII range (space..tilde) maps directly via ImGuiKey_A etc.
+    if (k >= 32 && k <= 90)  return static_cast<ImGuiKey>(ImGuiKey_A + (k - 65));
+    switch (k) {
+      case 256: return ImGuiKey_Escape;
+      case 257: return ImGuiKey_Enter;
+      case 258: return ImGuiKey_Tab;
+      case 259: return ImGuiKey_Backspace;
+      case 260: return ImGuiKey_Insert;
+      case 261: return ImGuiKey_Delete;
+      case 262: return ImGuiKey_RightArrow;
+      case 263: return ImGuiKey_LeftArrow;
+      case 264: return ImGuiKey_DownArrow;
+      case 265: return ImGuiKey_UpArrow;
+      case 266: return ImGuiKey_PageUp;
+      case 267: return ImGuiKey_PageDown;
+      case 268: return ImGuiKey_Home;
+      case 269: return ImGuiKey_End;
+      case 290: return ImGuiKey_F1;  case 291: return ImGuiKey_F2;
+      case 292: return ImGuiKey_F3;  case 293: return ImGuiKey_F4;
+      case 294: return ImGuiKey_F5;  case 295: return ImGuiKey_F6;
+      case 296: return ImGuiKey_F7;  case 297: return ImGuiKey_F8;
+      case 298: return ImGuiKey_F9;  case 299: return ImGuiKey_F10;
+      case 300: return ImGuiKey_F11; case 301: return ImGuiKey_F12;
+      case 340: return ImGuiKey_LeftShift;
+      case 341: return ImGuiKey_LeftCtrl;
+      case 342: return ImGuiKey_LeftAlt;
+      case 343: return ImGuiKey_LeftSuper;
+      case 344: return ImGuiKey_RightShift;
+      case 345: return ImGuiKey_RightCtrl;
+      case 346: return ImGuiKey_RightAlt;
+      case 347: return ImGuiKey_RightSuper;
+      default:  return ImGuiKey_None;
+    }
+  };
 
-  // Update modifier keys
-  // Using GLFW key codes instead of Windows-specific VK_* constants
-  io.KeyCtrl = io.KeysDown[341] || io.KeysDown[345]; // Left/Right Control
-  io.KeyShift = io.KeysDown[340] || io.KeysDown[344]; // Left/Right Shift
-  io.KeyAlt = io.KeysDown[342] || io.KeysDown[346]; // Left/Right Alt
-  io.KeySuper = io.KeysDown[343] || io.KeysDown[347]; // Left/Right Super
+  ImGuiKey imkey = glfwToImGuiKey(key);
+  if (imkey != ImGuiKey_None)
+    io.AddKeyEvent(imkey, pressed);
+
+  // Keep modifier state in sync
+  io.AddKeyEvent(ImGuiMod_Ctrl,  io.KeyCtrl);
+  io.AddKeyEvent(ImGuiMod_Shift, io.KeyShift);
+  io.AddKeyEvent(ImGuiMod_Alt,   io.KeyAlt);
+  io.AddKeyEvent(ImGuiMod_Super, io.KeySuper);
 }
 
 void ImGuiSystem::HandleChar(uint32_t c) {

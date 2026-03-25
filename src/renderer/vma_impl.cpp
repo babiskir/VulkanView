@@ -1,0 +1,8 @@
+/* VMA implementation translation unit.
+ * Must be compiled in exactly one .cpp file.
+ */
+#define VMA_IMPLEMENTATION
+#define VMA_STATIC_VULKAN_FUNCTIONS 0
+#define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
+#define VMA_VULKAN_VERSION 1002000
+#include "vk_mem_alloc.h"

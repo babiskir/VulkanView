@@ -17,6 +17,7 @@
 #include "renderer.h"
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -162,21 +163,25 @@ bool Renderer::Initialize(const std::string& appName, bool enableValidationLayer
     return false;
   }
 
-  // Initialize memory pool for efficient memory management
-  try {
-    memoryPool = std::make_unique<MemoryPool>(device, physicalDevice);
-    if (!memoryPool->initialize()) {
-      std::cerr << "Failed to initialize memory pool" << std::endl;
+  // Initialize VMA allocator
+  {
+    VmaVulkanFunctions vmaVulkanFuncs{};
+    vmaVulkanFuncs.vkGetInstanceProcAddr = &vkGetInstanceProcAddr;
+    vmaVulkanFuncs.vkGetDeviceProcAddr   = &vkGetDeviceProcAddr;
+
+    VmaAllocatorCreateInfo allocatorInfo{};
+    allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2;
+    allocatorInfo.physicalDevice   = *physicalDevice;
+    allocatorInfo.device           = *device;
+    allocatorInfo.instance         = *instance;
+    allocatorInfo.pVulkanFunctions = &vmaVulkanFuncs;
+    allocatorInfo.flags            = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+
+    if (vmaCreateAllocator(&allocatorInfo, &vmaAllocator) != VK_SUCCESS) {
+      std::cerr << "Failed to create VMA allocator" << std::endl;
       return false;
     }
-
-    // Optionally pre-allocate initial memory blocks for pools.
-    // For large scenes (e.g., Bistro) on mid-range GPUs this can cause early OOM.
-    // Skip pre-allocation to reduce peak memory pressure; blocks will be created on demand.
-    // if (!memoryPool->preAllocatePools()) { /* non-fatal */ }
-  } catch (const std::exception& e) {
-    std::cerr << "Failed to create memory pool: " << e.what() << std::endl;
-    return false;
+    std::cout << "VMA allocator created." << std::endl;
   }
 
   // Create swap chain
@@ -277,6 +282,12 @@ bool Renderer::Initialize(const std::string& appName, bool enableValidationLayer
     }
   }
 
+  // Create CSM depth pipeline (creates csmDepthDescriptorSetLayout used by createCSMResources)
+  if (!createCSMDepthPipeline()) {
+    std::cerr << "Warning: Failed to create CSM depth pipeline — shadows disabled" << std::endl;
+    // Non-fatal: continue without CSM
+  }
+
   // Create the descriptor pool
   if (!createDescriptorPool()) {
     std::cerr << "Failed to create descriptor pool" << std::endl;
@@ -314,6 +325,55 @@ bool Renderer::Initialize(const std::string& appName, bool enableValidationLayer
   if (!createSharedDefaultPBRTextures()) {
     std::cerr << "Failed to create shared default PBR textures" << std::endl;
     return false;
+  }
+
+  // Create CSM resources (shadow map images, samplers, UBO buffers)
+  // Requires csmDepthDescriptorSetLayout created by createCSMDepthPipeline()
+  if (*csmDepthDescriptorSetLayout) {
+    if (!createCSMResources()) {
+      std::cerr << "Warning: Failed to create CSM resources — shadows disabled" << std::endl;
+    }
+  }
+
+  // Create sky pipeline
+  if (!createSkyPipeline()) {
+    std::cerr << "Warning: Failed to create sky pipeline — sky disabled" << std::endl;
+  }
+
+  // Create water pipeline (always — WaterSystem may be activated at runtime)
+  if (!createWaterPipeline()) {
+    std::cerr << "Warning: Failed to create water pipeline\n";
+  }
+
+  // Create bloom pipelines + resources (dual-Kawase HDR bloom)
+  if (!createBloomPipelines()) {
+    std::cerr << "Warning: Failed to create bloom pipelines — bloom disabled\n";
+    enableBloom = false;
+  } else if (!createBloomResources()) {
+    std::cerr << "Warning: Failed to create bloom resources — bloom disabled\n";
+    enableBloom = false;
+  }
+
+  // Create auto-exposure pipelines + resources (histogram-based, [Ch18])
+  if (!createExposurePipelines()) {
+    std::cerr << "Warning: Failed to create exposure pipelines — auto-exposure disabled\n";
+    enableAutoExposure = false;
+  } else if (!createExposureResources()) {
+    std::cerr << "Warning: Failed to create exposure resources — auto-exposure disabled\n";
+    enableAutoExposure = false;
+  }
+
+  // Load HDR environment map if present (equirectangular, used for sky + water reflections)
+  {
+    const char* envPath = "Assets/hdri/farm_field_puresky_4k.exr";
+    if (std::filesystem::exists(envPath)) {
+      if (!LoadEnvTexture(envPath))
+        std::cerr << "Warning: Failed to load env texture from " << envPath << "\n";
+      else
+        useEnvMapForSky = true;  // default to HDR map when one is available
+    } else {
+      std::cout << "[EnvTex] No env texture found at " << envPath << " — using procedural sky.\n";
+    }
   }
 
   // Create command buffers
@@ -419,10 +479,13 @@ void Renderer::Cleanup() {
     resources.basicDescriptorSets.clear();
     resources.pbrDescriptorSets.clear();
     resources.uniformBuffers.clear();
+    for (auto& ua : resources.uniformBufferAllocations) {
+      if (ua) { vmaFreeMemory(vmaAllocator, ua); ua = VK_NULL_HANDLE; }
+    }
     resources.uniformBufferAllocations.clear();
     resources.uniformBuffersMapped.clear();
     resources.instanceBuffer = nullptr;
-    resources.instanceBufferAllocation = nullptr;
+    if (resources.instanceBufferAllocation) { vmaFreeMemory(vmaAllocator, resources.instanceBufferAllocation); resources.instanceBufferAllocation = VK_NULL_HANDLE; }
     resources.instanceBufferMapped = nullptr;
   }
   entityResources.clear();
@@ -449,11 +512,35 @@ void Renderer::Cleanup() {
   pbrBlendGraphicsPipeline = nullptr;
   pbrPremulBlendGraphicsPipeline = nullptr;
   pbrPrepassGraphicsPipeline = nullptr;
+  pbrReflectionGraphicsPipeline = nullptr;
   glassGraphicsPipeline = nullptr;
   lightingPipeline = nullptr;
   compositePipeline = nullptr;
   forwardPlusPipeline = nullptr;
   depthPrepassPipeline = nullptr;
+  computePipeline = nullptr;
+
+  // 4.1) Sky pipeline + env texture descriptor set
+  skyDescriptorSet       = nullptr;
+  skyDescriptorPool      = nullptr;
+  skyDescriptorSetLayout = nullptr;
+  skyPipeline            = nullptr;
+  skyPipelineLayout      = nullptr;
+
+  // 4.1.1) Environment HDR texture
+  envImageView  = nullptr;
+  envSampler    = nullptr;
+  envImage      = nullptr;
+  envMemory     = nullptr;
+  hasEnvTexture = false;
+
+  // 4.2) Water pipeline
+  waterPipeline = nullptr;
+  waterPipelineLayout = nullptr;
+
+  // 4.2.5) CSM depth pipeline
+  csmDepthPipeline = nullptr;
+  csmDepthPipelineLayout = nullptr;
 
   pipelineLayout = nullptr;
   pbrPipelineLayout = nullptr;
@@ -461,6 +548,7 @@ void Renderer::Cleanup() {
   compositePipelineLayout = nullptr;
   pbrTransparentPipelineLayout = nullptr;
   forwardPlusPipelineLayout = nullptr;
+  computePipelineLayout = nullptr;
 
   // 4.3) Ray query pipelines and layouts
   rayQueryPipeline = nullptr;
@@ -470,18 +558,18 @@ void Renderer::Cleanup() {
   // BEFORE destroying descriptor pools to avoid vkFreeDescriptorSets with invalid pool
   for (auto& fp : forwardPlusPerFrame) {
     fp.tileHeaders = nullptr;
-    fp.tileHeadersAlloc = nullptr;
+    if (fp.tileHeadersAlloc) { vmaFreeMemory(vmaAllocator, fp.tileHeadersAlloc); fp.tileHeadersAlloc = VK_NULL_HANDLE; }
     fp.tileLightIndices = nullptr;
-    fp.tileLightIndicesAlloc = nullptr;
+    if (fp.tileLightIndicesAlloc) { vmaFreeMemory(vmaAllocator, fp.tileLightIndicesAlloc); fp.tileLightIndicesAlloc = VK_NULL_HANDLE; }
     fp.params = nullptr;
-    fp.paramsAlloc = nullptr;
+    if (fp.paramsAlloc) { vmaFreeMemory(vmaAllocator, fp.paramsAlloc); fp.paramsAlloc = VK_NULL_HANDLE; }
     fp.paramsMapped = nullptr;
     fp.debugOut = nullptr;
-    fp.debugOutAlloc = nullptr;
+    if (fp.debugOutAlloc) { vmaFreeMemory(vmaAllocator, fp.debugOutAlloc); fp.debugOutAlloc = VK_NULL_HANDLE; }
     fp.probeOffscreen = nullptr;
-    fp.probeOffscreenAlloc = nullptr;
+    if (fp.probeOffscreenAlloc) { vmaFreeMemory(vmaAllocator, fp.probeOffscreenAlloc); fp.probeOffscreenAlloc = VK_NULL_HANDLE; }
     fp.probeSwapchain = nullptr;
-    fp.probeSwapchainAlloc = nullptr;
+    if (fp.probeSwapchainAlloc) { vmaFreeMemory(vmaAllocator, fp.probeSwapchainAlloc); fp.probeSwapchainAlloc = VK_NULL_HANDLE; }
     fp.computeSet = nullptr; // descriptor set allocated from compute/graphics pools
   }
   forwardPlusPerFrame.clear();
@@ -494,6 +582,11 @@ void Renderer::Cleanup() {
   forwardPlusDescriptorSetLayout = nullptr;
   computeDescriptorSetLayout = nullptr;
   rayQueryDescriptorSetLayout = nullptr;
+  csmDepthDescriptorSetLayout = nullptr;
+  waterDescriptorSetLayout = nullptr;
+
+  // CSM per-frame resources (descriptor sets allocated from csmFrames' own pools)
+  csmFrames.clear();
 
   // Pools last, after sets are cleared
   computeDescriptorPool = nullptr;
@@ -502,6 +595,11 @@ void Renderer::Cleanup() {
   // 6) Clear textures and aliases, including default resources
   {
     std::unique_lock<std::shared_mutex> lk(textureResourcesMutex);
+    // Free VMA allocations before RAII image/view handles are destroyed
+    for (auto& kv : textureResources) {
+      auto& tr = kv.second;
+      if (tr.textureImageAllocation) { vmaFreeMemory(vmaAllocator, tr.textureImageAllocation); tr.textureImageAllocation = VK_NULL_HANDLE; }
+    }
     textureResources.clear();
     textureAliases.clear();
   }
@@ -509,11 +607,12 @@ void Renderer::Cleanup() {
   defaultTextureResources.textureSampler = nullptr;
   defaultTextureResources.textureImageView = nullptr;
   defaultTextureResources.textureImage = nullptr;
-  defaultTextureResources.textureImageAllocation = nullptr;
+  if (defaultTextureResources.textureImageAllocation) { vmaFreeMemory(vmaAllocator, defaultTextureResources.textureImageAllocation); defaultTextureResources.textureImageAllocation = VK_NULL_HANDLE; }
 
   // 7) Opaque scene color and related descriptors
   opaqueSceneColorSampler = nullptr;
   opaqueSceneColorImages.clear();
+  for (auto& a : opaqueSceneColorImageAllocations) { if (a) { vmaFreeMemory(vmaAllocator, a); a = VK_NULL_HANDLE; } }
   opaqueSceneColorImageAllocations.clear();
   opaqueSceneColorImageViews.clear();
   opaqueSceneColorImageLayouts.clear();
@@ -521,13 +620,55 @@ void Renderer::Cleanup() {
   // 7.5) Ray query output image and acceleration structures
   rayQueryOutputImageView = nullptr;
   rayQueryOutputImage = nullptr;
-  rayQueryOutputImageAllocation = nullptr;
+  if (rayQueryOutputImageAllocation) { vmaFreeMemory(vmaAllocator, rayQueryOutputImageAllocation); rayQueryOutputImageAllocation = VK_NULL_HANDLE; }
+
+  // Free ray query uniform buffer allocations
+  for (auto& a : rayQueryUniformAllocations) { if (a) { vmaFreeMemory(vmaAllocator, a); a = VK_NULL_HANDLE; } }
+  rayQueryUniformAllocations.clear();
+  rayQueryUniformBuffers.clear();
+  rayQueryUniformBuffersMapped.clear();
+
+  // Free TLAS persistent buffers
+  tlasInstancesBuffer = nullptr;
+  if (tlasInstancesAllocation) { vmaFreeMemory(vmaAllocator, tlasInstancesAllocation); tlasInstancesAllocation = VK_NULL_HANDLE; }
+  tlasUpdateScratchBuffer = nullptr;
+  if (tlasUpdateScratchAllocation) { vmaFreeMemory(vmaAllocator, tlasUpdateScratchAllocation); tlasUpdateScratchAllocation = VK_NULL_HANDLE; }
 
   // Clear acceleration structures (BLAS and TLAS buffers)
+  // (VmaAllocation in AccelerationStructure.allocation freed via BLAS/TLAS loop below)
+  for (auto& blas : blasStructures) {
+    blas.handle = nullptr;
+    blas.buffer = nullptr;
+    if (blas.allocation) { vmaFreeMemory(vmaAllocator, blas.allocation); blas.allocation = VK_NULL_HANDLE; }
+  }
   blasStructures.clear();
-  tlasStructure = AccelerationStructure{};
+  tlasStructure.handle = nullptr;
+  tlasStructure.buffer = nullptr;
+  if (tlasStructure.allocation) { vmaFreeMemory(vmaAllocator, tlasStructure.allocation); tlasStructure.allocation = VK_NULL_HANDLE; }
 
-  // 8) (moved above) Forward+ per-frame buffers cleared prior to pool destruction
+  // Free geometry/material info buffers
+  geometryInfoBuffer = nullptr;
+  if (geometryInfoAllocation) { vmaFreeMemory(vmaAllocator, geometryInfoAllocation); geometryInfoAllocation = VK_NULL_HANDLE; }
+  materialBuffer = nullptr;
+  if (materialAllocation) { vmaFreeMemory(vmaAllocator, materialAllocation); materialAllocation = VK_NULL_HANDLE; }
+
+  // 8) Light storage buffers
+  for (auto& lsb : lightStorageBuffers) {
+    lsb.buffer = nullptr;
+    if (lsb.allocation) { vmaFreeMemory(vmaAllocator, lsb.allocation); lsb.allocation = VK_NULL_HANDLE; }
+    lsb.mapped = nullptr;
+  }
+  lightStorageBuffers.clear();
+
+  // 8.1) Mesh resources
+  for (auto& kv : meshResources) {
+    auto& mr = kv.second;
+    mr.vertexBuffer = nullptr;
+    if (mr.vertexBufferAllocation) { vmaFreeMemory(vmaAllocator, mr.vertexBufferAllocation); mr.vertexBufferAllocation = VK_NULL_HANDLE; }
+    mr.indexBuffer = nullptr;
+    if (mr.indexBufferAllocation) { vmaFreeMemory(vmaAllocator, mr.indexBufferAllocation); mr.indexBufferAllocation = VK_NULL_HANDLE; }
+  }
+  meshResources.clear();
 
   // 9) Command buffers/pools
   commandBuffers.clear();
@@ -547,8 +688,11 @@ void Renderer::Cleanup() {
   transferQueue = nullptr;
   surface = nullptr;
 
-  // 12) Memory pool last
-  memoryPool.reset();
+  // 12) VMA allocator last (after all buffers/images have been destroyed)
+  if (vmaAllocator) {
+    vmaDestroyAllocator(vmaAllocator);
+    vmaAllocator = VK_NULL_HANDLE;
+  }
 
   // Finally mark uninitialized
   initialized = false;
@@ -771,6 +915,9 @@ bool Renderer::pickPhysicalDevice() {
 
       // Store queue family indices for the selected device
       queueFamilyIndices = findQueueFamilies(physicalDevice);
+
+      // Log capability matrix against the SimpleEngine baseline profile
+      checkAndLogVulkanProfile();
 
       // Add supported optional extensions
       addSupportedOptionalExtensions();
@@ -1133,4 +1280,132 @@ bool Renderer::checkValidationLayerSupport() const {
   }
 
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan Profile capability check — logs a compatibility matrix against the
+// SimpleEngine baseline profile requirements defined in
+// vulkan_profiles/SimpleEngine_baseline.json.
+// Called once after device selection so problems are surfaced at startup.
+// ---------------------------------------------------------------------------
+void Renderer::checkAndLogVulkanProfile() {
+  try {
+    auto props = physicalDevice.getProperties();
+    std::cout << "\n=== Vulkan Profile Check [VP_SIMPLEENGINE_BASELINE_1_0] ===" << std::endl;
+    std::cout << "  Device : " << props.deviceName << std::endl;
+    std::cout << "  API    : "
+              << VK_VERSION_MAJOR(props.apiVersion) << "."
+              << VK_VERSION_MINOR(props.apiVersion) << "."
+              << VK_VERSION_PATCH(props.apiVersion) << std::endl;
+
+    // Query all relevant feature structs in one call
+    auto chain = physicalDevice.getFeatures2<
+      vk::PhysicalDeviceFeatures2,
+      vk::PhysicalDeviceVulkan12Features,
+      vk::PhysicalDeviceVulkan13Features>();
+
+    auto& f10 = chain.get<vk::PhysicalDeviceFeatures2>().features;
+    auto& f12 = chain.get<vk::PhysicalDeviceVulkan12Features>();
+    auto& f13 = chain.get<vk::PhysicalDeviceVulkan13Features>();
+
+    auto& limits = props.limits;
+
+    bool ok = true;
+    auto check = [&](const char* name, bool have, bool required) {
+      std::cout << "  " << (have ? "[+]" : (required ? "[!]" : "[-]"))
+                << " " << name << " : " << (have ? "OK" : (required ? "MISSING" : "optional")) << "\n";
+      if (required && !have) ok = false;
+    };
+
+    check("Vulkan 1.3 API",            props.apiVersion >= VK_API_VERSION_1_3, true);
+    check("samplerAnisotropy",         (bool)f10.samplerAnisotropy,   true);
+    check("fillModeNonSolid",          (bool)f10.fillModeNonSolid,    true);
+    check("shaderInt64",               (bool)f10.shaderInt64,         false);
+    check("multiDrawIndirect",         (bool)f10.multiDrawIndirect,   false);
+    check("descriptorIndexing",                        (bool)f12.descriptorIndexing,                        true);
+    check("shaderSampledImageArrayNonUniformIndexing", (bool)f12.shaderSampledImageArrayNonUniformIndexing, true);
+    check("runtimeDescriptorArray",                   (bool)f12.runtimeDescriptorArray,                    true);
+    check("descriptorBindingPartiallyBound",           (bool)f12.descriptorBindingPartiallyBound,           true);
+    check("descriptorBindingVariableDescriptorCount",  (bool)f12.descriptorBindingVariableDescriptorCount,  false);
+    check("timelineSemaphore",                         (bool)f12.timelineSemaphore,                         true);
+    check("bufferDeviceAddress",                       (bool)f12.bufferDeviceAddress,                       false);
+    check("dynamicRendering",          (bool)f13.dynamicRendering,    true);
+    check("synchronization2",          (bool)f13.synchronization2,    true);
+    check("maxPushConstantsSize >= 128",          limits.maxPushConstantsSize >= 128,          true);
+    check("maxDescriptorSetSamplers >= 512",      limits.maxDescriptorSetSamplers >= 512,      true);
+    check("maxDescriptorSetSampledImages >= 512", limits.maxDescriptorSetSampledImages >= 512, true);
+    check("maxDescriptorSetStorageBuffers >= 64", limits.maxDescriptorSetStorageBuffers >= 64, true);
+    check("maxComputeWorkGroupInvocations >= 256",limits.maxComputeWorkGroupInvocations >= 256,true);
+
+    // Optional ray-tracing profile
+    auto availExts = physicalDevice.enumerateDeviceExtensionProperties();
+    auto hasExt = [&](const char* name) {
+      for (auto& e : availExts) if (strcmp(e.extensionName, name) == 0) return true;
+      return false;
+    };
+    check("VK_KHR_acceleration_structure (RT optional)", hasExt("VK_KHR_acceleration_structure"), false);
+    check("VK_KHR_ray_query (RT optional)",              hasExt("VK_KHR_ray_query"),              false);
+
+    std::cout << "\n  Profile result: "
+              << (ok ? "PASS — device meets VP_SIMPLEENGINE_BASELINE_1_0 requirements."
+                     : "FAIL — one or more required capabilities are missing.")
+              << "\n=========================================================\n" << std::endl;
+  } catch (const std::exception& e) {
+    std::cerr << "checkAndLogVulkanProfile: " << e.what() << std::endl;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Debug label / object-name helpers (VK_EXT_debug_utils).
+// No-ops when the extension loader has not resolved the entry points.
+// ---------------------------------------------------------------------------
+
+void Renderer::BeginDebugLabel(vk::raii::CommandBuffer& cmd, const char* name,
+                               float r, float g, float b, float a) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBeginDebugUtilsLabelEXT) return;
+  vk::DebugUtilsLabelEXT label{};
+  label.pLabelName = name;
+  label.color[0] = r; label.color[1] = g; label.color[2] = b; label.color[3] = a;
+  cmd.beginDebugUtilsLabelEXT(label);
+}
+
+void Renderer::EndDebugLabel(vk::raii::CommandBuffer& cmd) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdEndDebugUtilsLabelEXT) return;
+  cmd.endDebugUtilsLabelEXT();
+}
+
+void Renderer::InsertDebugLabel(vk::raii::CommandBuffer& cmd, const char* name,
+                                float r, float g, float b, float a) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdInsertDebugUtilsLabelEXT) return;
+  vk::DebugUtilsLabelEXT label{};
+  label.pLabelName = name;
+  label.color[0] = r; label.color[1] = g; label.color[2] = b; label.color[3] = a;
+  cmd.insertDebugUtilsLabelEXT(label);
+}
+
+void Renderer::SetDebugName(vk::Buffer buffer, const char* name) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT || !*device) return;
+  vk::DebugUtilsObjectNameInfoEXT info{};
+  info.objectType   = vk::ObjectType::eBuffer;
+  info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer));
+  info.pObjectName  = name;
+  device.setDebugUtilsObjectNameEXT(info);
+}
+
+void Renderer::SetDebugName(vk::Image image, const char* name) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT || !*device) return;
+  vk::DebugUtilsObjectNameInfoEXT info{};
+  info.objectType   = vk::ObjectType::eImage;
+  info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkImage>(image));
+  info.pObjectName  = name;
+  device.setDebugUtilsObjectNameEXT(info);
+}
+
+void Renderer::SetDebugName(vk::Pipeline pipeline, const char* name) {
+  if (!VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT || !*device) return;
+  vk::DebugUtilsObjectNameInfoEXT info{};
+  info.objectType   = vk::ObjectType::ePipeline;
+  info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+  info.pObjectName  = name;
+  device.setDebugUtilsObjectNameEXT(info);
 }

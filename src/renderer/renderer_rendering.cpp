@@ -20,6 +20,7 @@
 #include "model_loader.h"
 #include "renderer.h"
 #include "transform_component.h"
+#include "water_system.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -193,20 +194,20 @@ bool Renderer::createReflectionResources(uint32_t width, uint32_t height) {
 
       // Color RT: use swapchain format to match existing PBR pipeline rendering formats
       vk::Format colorFmt = swapChainImageFormat;
-      auto [colorImg, colorAlloc] = createImagePooled(
+      auto [colorImg, colorAlloc] = createVmaImage(
         width,
         height,
         colorFmt,
         vk::ImageTiling::eOptimal,
         // Allow sampling in glass and blitting to swapchain for diagnostics
         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         /*mipLevels*/
         1,
         vk::SharingMode::eExclusive,
         {});
       rt.color = std::move(colorImg);
-      rt.colorAlloc = std::move(colorAlloc);
+      rt.colorAlloc = colorAlloc;
       rt.colorView = createImageView(rt.color, colorFmt, vk::ImageAspectFlagBits::eColor, 1);
       // Simple sampler for sampling reflection texture (no mips)
       vk::SamplerCreateInfo sampInfo{.magFilter = vk::Filter::eLinear, .minFilter = vk::Filter::eLinear, .mipmapMode = vk::SamplerMipmapMode::eNearest, .addressModeU = vk::SamplerAddressMode::eClampToEdge, .addressModeV = vk::SamplerAddressMode::eClampToEdge, .addressModeW = vk::SamplerAddressMode::eClampToEdge, .minLod = 0.0f, .maxLod = 0.0f};
@@ -214,19 +215,19 @@ bool Renderer::createReflectionResources(uint32_t width, uint32_t height) {
 
       // Depth RT
       vk::Format depthFmt = findDepthFormat();
-      auto [depthImg, depthAlloc] = createImagePooled(
+      auto [depthImg, depthAlloc] = createVmaImage(
         width,
         height,
         depthFmt,
         vk::ImageTiling::eOptimal,
         vk::ImageUsageFlagBits::eDepthStencilAttachment,
-        vk::MemoryPropertyFlagBits::eDeviceLocal,
+        VMA_MEMORY_USAGE_GPU_ONLY,
         /*mipLevels*/
         1,
         vk::SharingMode::eExclusive,
         {});
       rt.depth = std::move(depthImg);
-      rt.depthAlloc = std::move(depthAlloc);
+      rt.depthAlloc = depthAlloc;
       rt.depthView = createImageView(rt.depth, depthFmt, vk::ImageAspectFlagBits::eDepth, 1);
     }
 
@@ -290,11 +291,11 @@ void Renderer::destroyReflectionResources() {
   for (auto& rt : reflections) {
     rt.colorSampler = vk::raii::Sampler(nullptr);
     rt.colorView = vk::raii::ImageView(nullptr);
-    rt.colorAlloc = nullptr;
     rt.color = vk::raii::Image(nullptr);
+    if (rt.colorAlloc) { vmaFreeMemory(vmaAllocator, rt.colorAlloc); rt.colorAlloc = VK_NULL_HANDLE; }
     rt.depthView = vk::raii::ImageView(nullptr);
-    rt.depthAlloc = nullptr;
     rt.depth = vk::raii::Image(nullptr);
+    if (rt.depthAlloc) { vmaFreeMemory(vmaAllocator, rt.depthAlloc); rt.depthAlloc = VK_NULL_HANDLE; }
     rt.width = rt.height = 0;
   }
 }
@@ -652,7 +653,7 @@ void Renderer::cleanupSwapChain() {
   // Clean up depth resources
   depthImageView = vk::raii::ImageView(nullptr);
   depthImage = vk::raii::Image(nullptr);
-  depthImageAllocation = nullptr;
+  if (depthImageAllocation) { vmaFreeMemory(vmaAllocator, depthImageAllocation); depthImageAllocation = VK_NULL_HANDLE; }
 
   // Clean up swap chain image views
   swapChainImageViews.clear();
@@ -781,6 +782,8 @@ void Renderer::recreateSwapChain() {
   createPBRPipeline();
   createLightingPipeline();
   createCompositePipeline();
+  // Recreate sky pipeline (uses swapChainImageFormat which may change on resize)
+  createSkyPipeline();
 
   // Recreate Forward+ specific pipelines/resources and resize tile buffers for new extent
   if (useForwardPlus) {
@@ -1059,17 +1062,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
   lastFrameUpdateTime.store(std::chrono::steady_clock::now(), std::memory_order_relaxed);
   watchdogProgressLabel.store("Render: frame begin", std::memory_order_relaxed);
 
-  if (memoryPool)
-    memoryPool->setRenderingActive(true);
-  struct RenderingStateGuard {
-    MemoryPool* pool;
-    explicit RenderingStateGuard(MemoryPool* p) : pool(p) {
-    }
-    ~RenderingStateGuard() {
-      if (pool)
-        pool->setRenderingActive(false);
-    }
-  } guard(memoryPool.get());
+  // (rendering-active guard removed; VMA does not require explicit rendering state tracking)
 
   // Track if ray query rendered successfully this frame to skip rasterization code path
   bool rayQueryRenderedThisFrame = false;
@@ -1776,6 +1769,16 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
     }
   }
 
+  // Compute CSM cascade matrices and upload UBO before command recording
+  if (enableCSM && !csmFrames.empty() && camera) {
+    computeCascadeMatrices(camera);
+    uploadCSMUBO(currentFrame);
+    // Update entity PBR descriptor sets with current CSM resources (safe point: after fence wait)
+    if (!isRecordingCmd.load(std::memory_order_relaxed)) {
+      updateCSMDescriptorSetsGlobal(currentFrame);
+    }
+  }
+
   commandBuffers[currentFrame].reset();
   // Begin command buffer recording for this frame
   commandBuffers[currentFrame].begin(vk::CommandBufferBeginInfo());
@@ -2217,6 +2220,63 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       ImGui::SliderFloat("Reflection intensity", &reflectionIntensity, 0.0f, 2.0f, "%.2f");
       ImGui::SliderFloat("Exposure", &exposure, 0.1f, 4.0f, "%.2f");
       ImGui::SliderFloat("Gamma", &gamma, 1.6f, 2.6f, "%.2f");
+
+      // ── Sky & Lighting (open by default) ────────────────────────────────
+      ImGui::Separator();
+      if (ImGui::CollapsingHeader("Sky & Lighting", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Enable Sky", &enableSky);
+
+        // Sky source
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Sky Source:");
+        if (hasEnvTexture) {
+          if (ImGui::RadioButton("Procedural (Preetham)", !useEnvMapForSky)) useEnvMapForSky = false;
+          ImGui::SameLine();
+          if (ImGui::RadioButton("HDR Environment Map",    useEnvMapForSky))  useEnvMapForSky = true;
+        } else {
+          ImGui::TextDisabled("Procedural (Preetham)  [load HDR to unlock env map]");
+        }
+
+        // Sun / atmosphere
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Sun & Atmosphere:");
+        float sunDir[3] = {sunDirection.x, sunDirection.y, sunDirection.z};
+        if (ImGui::SliderFloat3("Sun Direction", sunDir, -1.0f, 1.0f)) {
+          glm::vec3 d(sunDir[0], sunDir[1], sunDir[2]);
+          float len = glm::length(d);
+          if (len > 1e-5f) sunDirection = d / len;
+        }
+        ImGui::SliderFloat("Turbidity",    &sunTurbidity, 1.0f, 10.0f, "%.1f");
+        ImGui::SliderFloat("Sun Intensity",&sunIntensity, 0.1f,  5.0f, "%.2f");
+
+        // Shadows
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Shadows:");
+        ImGui::Checkbox("Enable Shadows (CSM)", &enableCSM);
+        ImGui::SliderFloat("Shadow Bias",  &csmDepthBiasConst, 0.0f, 5.0f, "%.2f");
+        ImGui::SliderFloat("Shadow Slope", &csmDepthBiasSlope, 0.0f, 5.0f, "%.2f");
+      }
+
+      // ── Ocean / Water ────────────────────────────────────────────────────
+      if (waterSystem && waterSystem->IsActive()) {
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Ocean / Water", ImGuiTreeNodeFlags_DefaultOpen)) {
+          ImGui::TextUnformatted("Simulation:");
+          ImGui::SliderFloat("Wave Amplitude",  &waterSystem->heightAmplitude, 0.1f, 10.0f, "%.2f");
+          ImGui::SliderFloat("Choppiness",      &waterSystem->choppiness,      0.0f,  5.0f, "%.2f");
+          ImGui::SliderFloat("Wind Speed",      &waterSystem->windSpeed,        1.0f, 60.0f, "%.1f");
+          ImGui::SliderFloat("Wind Angle (°)",  &waterSystem->windAngleDeg,     0.0f, 360.0f, "%.0f");
+          ImGui::SliderFloat("Texture Scale",   &waterSystem->textureScale,     0.1f,  2.0f, "%.2f");
+
+          ImGui::Spacing();
+          ImGui::TextUnformatted("Appearance:");
+          ImGui::SliderFloat("Sky Intensity",      &waterSystem->skyIntensity,       0.0f, 5.0f, "%.2f");
+          ImGui::SliderFloat("Specular Intensity", &waterSystem->specularIntensity,  0.0f, 5.0f, "%.2f");
+          ImGui::SliderFloat("Specular Highlight", &waterSystem->specularHighlights, 1.0f, 256.0f, "%.0f");
+          ImGui::SliderFloat("Sun Intensity (water)", &waterSystem->sunIntensity,    0.0f, 5.0f, "%.2f");
+          ImGui::SliderFloat("Water Depth",        &waterSystem->waterDepth,         1.0f, 500.0f, "%.0f");
+        }
+      }
     }
     ImGui::End();
   }
@@ -2272,6 +2332,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
         // Depth-only rendering
         vk::RenderingAttachmentInfo depthOnlyAttachment{.imageView = *depthImageView, .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal, .loadOp = vk::AttachmentLoadOp::eClear, .storeOp = vk::AttachmentStoreOp::eStore, .clearValue = vk::ClearDepthStencilValue{1.0f, 0}};
         vk::RenderingInfo depthOnlyInfo{.renderArea = vk::Rect2D({0, 0}, swapChainExtent), .layerCount = 1, .colorAttachmentCount = 0, .pColorAttachments = nullptr, .pDepthAttachment = &depthOnlyAttachment};
+        BeginDebugLabel(commandBuffers[currentFrame], "Depth Prepass", 0.3f, 0.6f, 0.9f);
         commandBuffers[currentFrame].beginRendering(depthOnlyInfo);
         vk::Viewport viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f);
         commandBuffers[currentFrame].setViewport(0, viewport);
@@ -2305,6 +2366,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
         }
 
         commandBuffers[currentFrame].endRendering();
+        EndDebugLabel(commandBuffers[currentFrame]);
 
         // Barrier to ensure depth is visible for subsequent passes (Sync2)
         vk::ImageMemoryBarrier2 depthToRead2{
@@ -2326,20 +2388,29 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       }
 
       // Forward+ compute culling based on current camera and screen tiles
-      uint32_t tilesX = (swapChainExtent.width + forwardPlusTileSizeX - 1) / forwardPlusTileSizeX;
-      uint32_t tilesY = (swapChainExtent.height + forwardPlusTileSizeY - 1) / forwardPlusTileSizeY;
+      if (camera) {
+        uint32_t tilesX = (swapChainExtent.width + forwardPlusTileSizeX - 1) / forwardPlusTileSizeX;
+        uint32_t tilesY = (swapChainExtent.height + forwardPlusTileSizeY - 1) / forwardPlusTileSizeY;
 
-      // Lights already extracted at frame start - use lastFrameLightCount for Forward+ params
-      glm::mat4 view = camera->GetViewMatrix();
-      glm::mat4 proj = camera->GetProjectionMatrix();
-      proj[1][1] *= -1.0f;
-      float nearZ = camera->GetNearPlane();
-      float farZ = camera->GetFarPlane();
-      updateForwardPlusParams(currentFrame, view, proj, lastFrameLightCount, tilesX, tilesY, forwardPlusSlicesZ, nearZ, farZ);
-      // As a last guard before dispatch, make sure compute binding 0 is valid for this frame
-      refreshForwardPlusComputeLightsBindingForFrame(currentFrame);
+        // Lights already extracted at frame start - use lastFrameLightCount for Forward+ params
+        glm::mat4 view = camera->GetViewMatrix();
+        glm::mat4 proj = camera->GetProjectionMatrix();
+        proj[1][1] *= -1.0f;
+        float nearZ = camera->GetNearPlane();
+        float farZ = camera->GetFarPlane();
+        updateForwardPlusParams(currentFrame, view, proj, lastFrameLightCount, tilesX, tilesY, forwardPlusSlicesZ, nearZ, farZ);
+        // As a last guard before dispatch, make sure compute binding 0 is valid for this frame
+        refreshForwardPlusComputeLightsBindingForFrame(currentFrame);
 
-      dispatchForwardPlus(commandBuffers[currentFrame], tilesX, tilesY, forwardPlusSlicesZ);
+        dispatchForwardPlus(commandBuffers[currentFrame], tilesX, tilesY, forwardPlusSlicesZ);
+      }
+    }
+
+    // CSM shadow pass: render depth maps for all cascades before opaque pass
+    if (enableCSM && !csmFrames.empty() && *csmDepthPipeline) {
+      BeginDebugLabel(commandBuffers[currentFrame], "CSM Shadow Pass", 0.6f, 0.3f, 0.1f);
+      renderCSMPasses(commandBuffers[currentFrame], camera, entities);
+      EndDebugLabel(commandBuffers[currentFrame]);
     }
 
     // PASS 1: RENDER OPAQUE OBJECTS TO OFF-SCREEN TEXTURE
@@ -2381,6 +2452,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
     }
     // PASS 1: OFF-SCREEN COLOR (Opaque)
     // Clear the off-screen target at the start of opaque rendering to a neutral black background
+    BeginDebugLabel(commandBuffers[currentFrame], "Opaque PBR Pass", 0.2f, 0.8f, 0.3f);
     vk::RenderingAttachmentInfo colorAttachment{.imageView = *opaqueSceneColorImageViews[currentFrame], .imageLayout = vk::ImageLayout::eColorAttachmentOptimal, .loadOp = vk::AttachmentLoadOp::eClear, .storeOp = vk::AttachmentStoreOp::eStore, .clearValue = vk::ClearColorValue(std::array < float, 4 >{0.0f, 0.0f, 0.0f, 1.0f})};
     depthAttachment.imageView = *depthImageView;
     depthAttachment.loadOp = (didOpaqueDepthPrepass) ? vk::AttachmentLoadOp::eLoad : vk::AttachmentLoadOp::eClear;
@@ -2449,6 +2521,323 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       }
     }
     commandBuffers[currentFrame].endRendering();
+    EndDebugLabel(commandBuffers[currentFrame]);
+
+    // WATER PASS: render ocean surface into the same off-screen color buffer (load existing)
+    if (waterSystem && waterSystem->IsActive() && *waterPipeline) {
+      waterSystem->Update(1.0f / 60.0f, camera); // fixed timestep; WaterSystem accumulates simTime
+
+      vk::RenderingAttachmentInfo waterColorAtt{
+        .imageView   = *opaqueSceneColorImageViews[currentFrame],
+        .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .loadOp      = vk::AttachmentLoadOp::eLoad,
+        .storeOp     = vk::AttachmentStoreOp::eStore
+      };
+      vk::RenderingAttachmentInfo waterDepthAtt{
+        .imageView   = *depthImageView,
+        .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+        .loadOp      = vk::AttachmentLoadOp::eLoad,
+        .storeOp     = vk::AttachmentStoreOp::eStore
+      };
+      vk::RenderingInfo waterPassInfo{
+        .renderArea            = vk::Rect2D({0, 0}, swapChainExtent),
+        .layerCount            = 1,
+        .colorAttachmentCount  = 1,
+        .pColorAttachments     = &waterColorAtt,
+        .pDepthAttachment      = &waterDepthAtt
+      };
+      // Upload wave textures OUTSIDE renderpass (image barriers + buffer copies)
+      waterSystem->UploadTextures(commandBuffers[currentFrame], currentFrame);
+
+      BeginDebugLabel(commandBuffers[currentFrame], "Water Pass", 0.1f, 0.5f, 0.9f);
+      commandBuffers[currentFrame].beginRendering(waterPassInfo);
+      vk::Viewport wvp(0.0f, 0.0f,
+                       static_cast<float>(swapChainExtent.width),
+                       static_cast<float>(swapChainExtent.height), 0.0f, 1.0f);
+      commandBuffers[currentFrame].setViewport(0, wvp);
+      vk::Rect2D wsc({0, 0}, swapChainExtent);
+      commandBuffers[currentFrame].setScissor(0, wsc);
+      waterSystem->Draw(commandBuffers[currentFrame], currentFrame);
+      commandBuffers[currentFrame].endRendering();
+      EndDebugLabel(commandBuffers[currentFrame]);
+    }
+
+    // SKY PASS: render procedural sky into opaqueSceneColor where depth == 1.0 (far plane)
+    if (enableSky && *skyPipeline && camera) {
+      BeginDebugLabel(commandBuffers[currentFrame], "Sky Pass", 0.4f, 0.7f, 1.0f);
+      // Transition depth: eDepthAttachmentOptimal -> eDepthReadOnlyOptimal for sky depth test
+      vk::ImageMemoryBarrier2 depthToReadOnly{
+        .srcStageMask  = vk::PipelineStageFlagBits2::eLateFragmentTests,
+        .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+        .dstStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+        .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+        .oldLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+        .newLayout     = vk::ImageLayout::eDepthReadOnlyOptimal,
+        .image         = *depthImage,
+        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}
+      };
+      vk::DependencyInfo depToRO{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &depthToReadOnly};
+      commandBuffers[currentFrame].pipelineBarrier2(depToRO);
+
+      renderSkyPass(commandBuffers[currentFrame], camera);
+
+      // Transition depth back: eDepthReadOnlyOptimal -> eDepthAttachmentOptimal for transparent pass
+      vk::ImageMemoryBarrier2 depthBackToWrite{
+        .srcStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+        .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+        .dstStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+        .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        .oldLayout     = vk::ImageLayout::eDepthReadOnlyOptimal,
+        .newLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+        .image         = *depthImage,
+        .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}
+      };
+      vk::DependencyInfo depBackToWrite{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &depthBackToWrite};
+      commandBuffers[currentFrame].pipelineBarrier2(depBackToWrite);
+      EndDebugLabel(commandBuffers[currentFrame]);
+    }
+
+    // ---------------------------------------------------------------------------
+    // BLOOM PASS: dual-Kawase downsample + tent upsample [Jimenez 2014]
+    // Bloom reads from opaqueSceneColorImages and blends the result additively
+    // back into it so the composite tonemap sees scene+bloom.
+    // ---------------------------------------------------------------------------
+    if (enableBloom && *bloomDownsamplePipeline && *bloomUpsamplePipeline && *bloomAddPipeline
+        && !bloomDownsampleSets.empty() && !IsLoading()) {
+
+      auto& cmd = commandBuffers[currentFrame];
+      BeginDebugLabel(cmd, "Bloom Pass", 1.0f, 0.8f, 0.2f);
+
+      // --- 1. Transition opaqueSceneColorImages → SHADER_READ_ONLY for downsample ---
+      {
+        vk::ImageMemoryBarrier2 b{
+          .srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+          .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+          .dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+          .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+          .oldLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+          .newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+          .image         = *opaqueSceneColorImages[currentFrame],
+          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+        };
+        vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+        cmd.pipelineBarrier2(dep);
+        if (currentFrame < opaqueSceneColorImageLayouts.size())
+          opaqueSceneColorImageLayouts[currentFrame] = vk::ImageLayout::eShaderReadOnlyOptimal;
+      }
+
+      // Push constant layout for BloomPush
+      struct BloomPush { float texelSizeX, texelSizeY; int mipLevel; float threshold, strength, _pad0, _pad1, _pad2; };
+
+      // --- 2. Downsample chain ---
+      for (uint32_t mip = 0; mip < BLOOM_MIP_COUNT; ++mip) {
+        // Transition bloomMips[mip] → COLOR_ATTACHMENT_OPTIMAL for writing
+        {
+          vk::ImageMemoryBarrier2 b{
+            .srcStageMask  = (mip == 0) ? vk::PipelineStageFlagBits2::eTopOfPipe : vk::PipelineStageFlagBits2::eFragmentShader,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout     = bloomMips[mip].layout,
+            .newLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+            .image         = *bloomMips[mip].image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+          };
+          vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+          cmd.pipelineBarrier2(dep);
+          bloomMips[mip].layout = vk::ImageLayout::eColorAttachmentOptimal;
+        }
+
+        // Bind and draw downsample
+        vk::RenderingAttachmentInfo colorAtt{
+          .imageView   = *bloomMips[mip].view,
+          .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+          .loadOp      = vk::AttachmentLoadOp::eDontCare,
+          .storeOp     = vk::AttachmentStoreOp::eStore
+        };
+        vk::RenderingInfo rinfo{
+          .renderArea       = {{0,0},{bloomMips[mip].width, bloomMips[mip].height}},
+          .layerCount       = 1,
+          .colorAttachmentCount = 1,
+          .pColorAttachments    = &colorAtt
+        };
+        cmd.beginRendering(rinfo);
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *bloomDownsamplePipeline);
+
+        vk::Viewport vp(0.0f, 0.0f, float(bloomMips[mip].width), float(bloomMips[mip].height), 0.0f, 1.0f);
+        cmd.setViewport(0, vp);
+        vk::Rect2D sc({0,0},{bloomMips[mip].width, bloomMips[mip].height});
+        cmd.setScissor(0, sc);
+
+        // src image for this mip: mip0 reads opaqueSceneColorImages, others read bloomMips[mip-1]
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+          *bloomPipelineLayout, 0, {*bloomDownsampleSets[mip]}, {});
+
+        // src texel size
+        uint32_t srcW = (mip == 0) ? swapChainExtent.width  : bloomMips[mip-1].width;
+        uint32_t srcH = (mip == 0) ? swapChainExtent.height : bloomMips[mip-1].height;
+        BloomPush pc{1.0f/srcW, 1.0f/srcH, (int)mip, bloomThreshold, bloomStrength, 0,0,0};
+        cmd.pushConstants<BloomPush>(*bloomPipelineLayout,
+          vk::ShaderStageFlagBits::eFragment, 0, pc);
+
+        cmd.draw(3, 1, 0, 0);
+        cmd.endRendering();
+
+        // Transition bloomMips[mip] → SHADER_READ_ONLY for next downsample / upsample
+        {
+          vk::ImageMemoryBarrier2 b{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image         = *bloomMips[mip].image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+          };
+          vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+          cmd.pipelineBarrier2(dep);
+          bloomMips[mip].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        }
+      }
+
+      // --- 3. Upsample chain (coarse → fine) ---
+      // bloomUpsampleSets[i] reads from bloomMips[coarseMip] and blends into bloomMips[fineMip]
+      for (uint32_t i = 0; i < BLOOM_MIP_COUNT - 1; ++i) {
+        uint32_t coarseMip = (BLOOM_MIP_COUNT - 1) - i;
+        uint32_t fineMip   = (BLOOM_MIP_COUNT - 2) - i;
+
+        // Transition fineMip → COLOR_ATTACHMENT_OPTIMAL for writing
+        {
+          vk::ImageMemoryBarrier2 b{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .oldLayout     = bloomMips[fineMip].layout,
+            .newLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+            .image         = *bloomMips[fineMip].image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+          };
+          vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+          cmd.pipelineBarrier2(dep);
+          bloomMips[fineMip].layout = vk::ImageLayout::eColorAttachmentOptimal;
+        }
+
+        vk::RenderingAttachmentInfo colorAtt{
+          .imageView   = *bloomMips[fineMip].view,
+          .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+          .loadOp      = vk::AttachmentLoadOp::eDontCare,
+          .storeOp     = vk::AttachmentStoreOp::eStore
+        };
+        vk::RenderingInfo rinfo{
+          .renderArea       = {{0,0},{bloomMips[fineMip].width, bloomMips[fineMip].height}},
+          .layerCount       = 1,
+          .colorAttachmentCount = 1,
+          .pColorAttachments    = &colorAtt
+        };
+        cmd.beginRendering(rinfo);
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *bloomUpsamplePipeline);
+
+        vk::Viewport vp(0.0f, 0.0f, float(bloomMips[fineMip].width), float(bloomMips[fineMip].height), 0.0f, 1.0f);
+        cmd.setViewport(0, vp);
+        vk::Rect2D sc({0,0},{bloomMips[fineMip].width, bloomMips[fineMip].height});
+        cmd.setScissor(0, sc);
+
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+          *bloomPipelineLayout, 0, {*bloomUpsampleSets[i]}, {});
+
+        // texelSize is from the coarse source
+        BloomPush pc{1.0f/bloomMips[coarseMip].width, 1.0f/bloomMips[coarseMip].height,
+                     (int)(BLOOM_MIP_COUNT-1), 0.f, bloomStrength, 0,0,0};
+        cmd.pushConstants<BloomPush>(*bloomPipelineLayout,
+          vk::ShaderStageFlagBits::eFragment, 0, pc);
+
+        cmd.draw(3, 1, 0, 0);
+        cmd.endRendering();
+
+        // Transition fineMip back to SHADER_READ_ONLY
+        {
+          vk::ImageMemoryBarrier2 b{
+            .srcStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+            .dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image         = *bloomMips[fineMip].image,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+          };
+          vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+          cmd.pipelineBarrier2(dep);
+          bloomMips[fineMip].layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+        }
+      }
+
+      // --- 4. Add bloom[0] additively into opaqueSceneColorImages ---
+      // Transition opaqueSceneColorImages → COLOR_ATTACHMENT_OPTIMAL for additive blend
+      {
+        vk::ImageMemoryBarrier2 b{
+          .srcStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+          .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+          .dstStageMask  = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+          .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentRead,
+          .oldLayout     = vk::ImageLayout::eShaderReadOnlyOptimal,
+          .newLayout     = vk::ImageLayout::eColorAttachmentOptimal,
+          .image         = *opaqueSceneColorImages[currentFrame],
+          .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}
+        };
+        vk::DependencyInfo dep{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+        cmd.pipelineBarrier2(dep);
+        if (currentFrame < opaqueSceneColorImageLayouts.size())
+          opaqueSceneColorImageLayouts[currentFrame] = vk::ImageLayout::eColorAttachmentOptimal;
+      }
+
+      {
+        vk::RenderingAttachmentInfo colorAtt{
+          .imageView   = *opaqueSceneColorImageViews[currentFrame],
+          .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+          .loadOp      = vk::AttachmentLoadOp::eLoad,   // preserve existing scene color
+          .storeOp     = vk::AttachmentStoreOp::eStore
+        };
+        vk::RenderingInfo rinfo{
+          .renderArea       = {{0,0}, swapChainExtent},
+          .layerCount       = 1,
+          .colorAttachmentCount = 1,
+          .pColorAttachments    = &colorAtt
+        };
+        cmd.beginRendering(rinfo);
+        cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *bloomAddPipeline);
+
+        vk::Viewport vp(0.0f, 0.0f, float(swapChainExtent.width), float(swapChainExtent.height), 0.0f, 1.0f);
+        cmd.setViewport(0, vp);
+        vk::Rect2D sc({0,0}, swapChainExtent);
+        cmd.setScissor(0, sc);
+
+        // Use bloomDownsampleSets[0] as a source for bloomMips[0]
+        // but we need a descriptor set that points to bloomMips[0].
+        // bloomUpsampleSets' last entry points to bloomMips[0] as addImage...
+        // Use a dedicated descriptor set: point bloomDownsampleSets[0] at bloomMips[0]
+        // via an update — but that's a side effect.
+        // Instead, use the last bloomUpsampleSet which has bloomMips[0] as addImage.
+        // Simpler: make bloomDownsampleSets[1] (which points to bloomMips[0] as srcImage)
+        // available. bloomDownsampleSets[1].srcImage = bloomMips[0].
+        // bloomDownsampleSets[i].srcImage = (i==0)?opaqueSceneColor:bloomMips[i-1]
+        // So bloomDownsampleSets[1].srcImage = bloomMips[0].
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+          *bloomPipelineLayout, 0, {*bloomDownsampleSets[1]}, {});
+
+        BloomPush pc{1.0f/bloomMips[0].width, 1.0f/bloomMips[0].height, 1, 0.f, bloomStrength, 0,0,0};
+        cmd.pushConstants<BloomPush>(*bloomPipelineLayout,
+          vk::ShaderStageFlagBits::eFragment, 0, pc);
+
+        cmd.draw(3, 1, 0, 0);
+        cmd.endRendering();
+      }
+      EndDebugLabel(cmd);
+    }
+    // End bloom pass — opaqueSceneColorImages is now in eColorAttachmentOptimal with bloom added
+
     // PASS 1b: PRESENT – composite path
     {
       // Transition off-screen to SHADER_READ for sampling (Sync2)
@@ -2494,6 +2883,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       // IMPORTANT: Composite pass does not use a depth attachment. Avoid binding it to satisfy dynamic rendering VUIDs.
       auto savedDepthPtr = renderingInfo.pDepthAttachment; // save to restore later
       renderingInfo.pDepthAttachment = nullptr;
+      BeginDebugLabel(commandBuffers[currentFrame], "Composite Pass", 0.9f, 0.5f, 0.1f);
       commandBuffers[currentFrame].beginRendering(renderingInfo);
 
       // Bind composite pipeline
@@ -2532,10 +2922,12 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       commandBuffers[currentFrame].draw(3, 1, 0, 0);
 
       commandBuffers[currentFrame].endRendering();
+      EndDebugLabel(commandBuffers[currentFrame]);
       // Restore depth attachment pointer for subsequent passes
       renderingInfo.pDepthAttachment = savedDepthPtr;
     }
     // PASS 2: RENDER TRANSPARENT OBJECTS TO THE SWAPCHAIN
+    BeginDebugLabel(commandBuffers[currentFrame], "Transparent Pass", 0.5f, 0.9f, 0.7f);
     {
       // Ensure depth attachment is bound again for the transparent pass
       renderingInfo.pDepthAttachment = &depthAttachment;
@@ -2588,7 +2980,9 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       }
       // End transparent rendering pass before any layout transitions (even if no transparent draws)
       commandBuffers[currentFrame].endRendering();
-    } {
+    }
+    EndDebugLabel(commandBuffers[currentFrame]);
+    {
       // Screenshot and final present transition are handled in rasterization path only
       // Ray query path handles these separately
 
@@ -2638,6 +3032,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
       swapChainImageLayouts[imageIndex] = presentToColor.newLayout;
 
     // Begin a dedicated render pass for ImGui (UI overlay)
+    BeginDebugLabel(commandBuffers[currentFrame], "ImGui Pass", 0.8f, 0.8f, 0.8f);
     vk::RenderingAttachmentInfo imguiColorAttachment{
       .imageView = *swapChainImageViews[imageIndex],
       .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -2656,6 +3051,7 @@ void Renderer::Render(const std::vector<Entity *>& entities, CameraComponent* ca
     imguiSystem->Render(commandBuffers[currentFrame], currentFrame);
 
     commandBuffers[currentFrame].endRendering();
+    EndDebugLabel(commandBuffers[currentFrame]);
 
     // Transition swapchain back to PRESENT layout after ImGui renders
     vk::ImageMemoryBarrier2 colorToPresent{
@@ -2754,4 +3150,317 @@ void Renderer::SetPlanarReflectionsEnabled(bool enabled) {
 
 void Renderer::TogglePlanarReflections() {
   SetPlanarReflectionsEnabled(!enablePlanarReflections);
+}
+void Renderer::computeCascadeMatrices(CameraComponent* camera) {
+  if (!camera || !enableCSM) return;
+
+  const float nearPlane = camera->GetNearPlane();
+  const float farPlane  = std::min(camera->GetFarPlane(), 150.0f);
+  const float lambda    = 0.75f;
+
+  glm::vec3 sunDir = glm::normalize(sunDirection);
+  glm::mat4 view   = camera->GetViewMatrix();
+  glm::mat4 proj   = camera->GetProjectionMatrix();
+  glm::mat4 invVP  = glm::inverse(proj * view);
+
+  std::array<float, CSM_CASCADE_COUNT + 1> splits;
+  splits[0] = nearPlane;
+  for (uint32_t i = 1; i <= CSM_CASCADE_COUNT; i++) {
+    float uniform = nearPlane + (farPlane - nearPlane) * float(i) / float(CSM_CASCADE_COUNT);
+    float log     = nearPlane * std::pow(farPlane / nearPlane, float(i) / float(CSM_CASCADE_COUNT));
+    splits[i] = glm::mix(uniform, log, lambda);
+  }
+
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    float splitNear = splits[c];
+    float splitFar  = splits[c + 1];
+
+    // Build 8 corners of the view sub-frustum in world space
+    glm::vec4 frustumCorners[8];
+    int idx = 0;
+    for (float x : {-1.0f, 1.0f})
+      for (float y : {-1.0f, 1.0f})
+        for (float z : {0.0f, 1.0f}) {
+          glm::vec4 pt = invVP * glm::vec4(x, y, z, 1.0f);
+          frustumCorners[idx++] = pt / pt.w;
+        }
+
+    for (int i = 0; i < 4; i++) {
+      glm::vec4 ray = frustumCorners[4 + i] - frustumCorners[i];
+      float tNear = (splitNear - nearPlane) / (farPlane - nearPlane);
+      float tFar  = (splitFar  - nearPlane) / (farPlane - nearPlane);
+      frustumCorners[4 + i] = frustumCorners[i] + ray * tFar;
+      frustumCorners[i]     = frustumCorners[i] + ray * tNear;
+    }
+
+    glm::vec3 center(0.0f);
+    for (auto& fc : frustumCorners) center += glm::vec3(fc);
+    center /= 8.0f;
+
+    float radius = 0.0f;
+    for (auto& fc : frustumCorners)
+      radius = std::max(radius, glm::length(glm::vec3(fc) - center));
+    radius = std::ceil(radius * 16.0f) / 16.0f;
+
+    glm::vec3 lightPos = center - sunDir * radius * 2.0f;
+    glm::mat4 lightView;
+    if (std::abs(sunDir.y) > 0.99f)
+      lightView = glm::lookAt(lightPos, center, glm::vec3(0, 0, 1));
+    else
+      lightView = glm::lookAt(lightPos, center, glm::vec3(0, 1, 0));
+
+    glm::mat4 lightProj = glm::ortho(-radius, radius, -radius, radius, 0.0f, radius * 4.0f);
+    lightProj[1][1] *= -1.0f; // Vulkan Y flip
+
+    // Texel-snapping to prevent shadow shimmer
+    glm::mat4 shadowMatrix = lightProj * lightView;
+    glm::vec4 origin = shadowMatrix * glm::vec4(0, 0, 0, 1);
+    origin *= (float)CSM_RESOLUTION / 2.0f;
+    glm::vec4 rounded = glm::round(origin);
+    glm::vec4 roundedOffset = rounded - origin;
+    roundedOffset *= 2.0f / (float)CSM_RESOLUTION;
+    roundedOffset.z = 0.0f; roundedOffset.w = 0.0f;
+    lightProj[3] += roundedOffset;
+
+    computedCascades[c].lightSpaceMatrix = lightProj * lightView;
+    computedCascades[c].splitFarVS = splitFar;
+  }
+}
+
+void Renderer::uploadCSMUBO(uint32_t frameIndex) {
+  if (csmFrames.empty() || frameIndex >= csmFrames.size()) return;
+  auto& csm = csmFrames[frameIndex];
+  if (!csm.uboMapped) return;
+
+  CsmUBO ubo{};
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    ubo.lightSpaceMatrices[c] = computedCascades[c].lightSpaceMatrix;
+  }
+  ubo.cascadeSplits = glm::vec4(
+    computedCascades[0].splitFarVS,
+    computedCascades[1].splitFarVS,
+    computedCascades[2].splitFarVS,
+    0.0f);
+  ubo.shadowParams  = glm::vec4(csmDepthBiasConst * 0.001f, csmDepthBiasSlope, 0.0f,
+                                 enableCSM ? 1.0f : 0.0f);
+  ubo.sunDirection  = glm::vec4(glm::normalize(sunDirection), 0.0f);
+  ubo.sunColor      = glm::vec4(1.0f, 0.95f, 0.85f, sunIntensity);
+  memcpy(csm.uboMapped, &ubo, sizeof(CsmUBO));
+}
+
+void Renderer::renderCSMPasses(vk::raii::CommandBuffer& cmd, CameraComponent* camera,
+                                const std::vector<Entity*>& entities) {
+  if (!enableCSM || csmFrames.empty() || !*csmDepthPipeline) return;
+
+  auto& csm = csmFrames[currentFrame];
+
+  // Transition all cascade images to depth attachment
+  std::vector<vk::ImageMemoryBarrier2> barriers;
+  barriers.reserve(CSM_CASCADE_COUNT);
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    vk::PipelineStageFlags2 srcStage = (csm.layouts[c] == vk::ImageLayout::eUndefined)
+      ? vk::PipelineStageFlagBits2::eTopOfPipe
+      : vk::PipelineStageFlagBits2::eFragmentShader;
+    vk::AccessFlags2 srcAccess = (csm.layouts[c] == vk::ImageLayout::eUndefined)
+      ? vk::AccessFlagBits2::eNone
+      : vk::AccessFlagBits2::eShaderRead;
+
+    vk::ImageMemoryBarrier2 barrier{
+      .srcStageMask  = srcStage,
+      .srcAccessMask = srcAccess,
+      .dstStageMask  = vk::PipelineStageFlagBits2::eEarlyFragmentTests,
+      .dstAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+      .oldLayout     = csm.layouts[c],
+      .newLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+      .image         = *csm.images[c],
+      .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}
+    };
+    barriers.push_back(barrier);
+    csm.layouts[c] = vk::ImageLayout::eDepthAttachmentOptimal;
+  }
+  vk::DependencyInfo depInfo{
+    .imageMemoryBarrierCount = (uint32_t)barriers.size(),
+    .pImageMemoryBarriers    = barriers.data()
+  };
+  cmd.pipelineBarrier2(depInfo);
+
+  // Render each cascade
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    vk::RenderingAttachmentInfo depthAttachment{
+      .imageView   = *csm.views[c],
+      .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+      .loadOp      = vk::AttachmentLoadOp::eClear,
+      .storeOp     = vk::AttachmentStoreOp::eStore,
+      .clearValue  = vk::ClearValue{vk::ClearDepthStencilValue{1.0f, 0}}
+    };
+    vk::RenderingInfo renderingInfo{
+      .renderArea       = {{0,0}, {CSM_RESOLUTION, CSM_RESOLUTION}},
+      .layerCount       = 1,
+      .pDepthAttachment = &depthAttachment
+    };
+    cmd.beginRendering(renderingInfo);
+
+    vk::Viewport vp{0, 0, (float)CSM_RESOLUTION, (float)CSM_RESOLUTION, 0.0f, 1.0f};
+    vk::Rect2D sc{{0,0},{CSM_RESOLUTION, CSM_RESOLUTION}};
+    cmd.setViewport(0, vp);
+    cmd.setScissor(0, sc);
+    cmd.setDepthBias(csmDepthBiasConst, 0.0f, csmDepthBiasSlope);
+    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *csmDepthPipeline);
+
+    vk::DescriptorSet ds = *csm.descriptorSet;
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *csmDepthPipelineLayout, 0, ds, {});
+
+    for (auto* entity : entities) {
+      if (!entity || !entity->IsActive()) continue;
+      auto* tc = entity->GetComponent<TransformComponent>();
+      auto* mc = entity->GetComponent<MeshComponent>();
+      if (!tc || !mc) continue;
+
+      auto meshIt = meshResources.find(mc);
+      if (meshIt == meshResources.end()) continue;
+      const auto& mres = meshIt->second;
+      if (!*mres.vertexBuffer || !*mres.indexBuffer || mres.indexCount == 0) continue;
+
+      glm::mat4 model = tc->GetModelMatrix();
+
+      struct CsmPush {
+        glm::mat4 model;
+        int cascade;
+        float pad[3];
+      } push;
+      push.model   = model;
+      push.cascade = (int)c;
+      push.pad[0] = push.pad[1] = push.pad[2] = 0.0f;
+      cmd.pushConstants<CsmPush>(*csmDepthPipelineLayout,
+        vk::ShaderStageFlagBits::eVertex, 0, push);
+
+      vk::Buffer vb = *mres.vertexBuffer;
+      vk::DeviceSize offset = 0;
+      cmd.bindVertexBuffers(0, vb, offset);
+      cmd.bindIndexBuffer(*mres.indexBuffer, 0, vk::IndexType::eUint32);
+      cmd.drawIndexed(mres.indexCount, 1, 0, 0, 0);
+    }
+
+    cmd.endRendering();
+  }
+
+  // Transition all cascades to shader-read for PBR sampling
+  barriers.clear();
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    vk::ImageMemoryBarrier2 barrier{
+      .srcStageMask  = vk::PipelineStageFlagBits2::eLateFragmentTests,
+      .srcAccessMask = vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+      .dstStageMask  = vk::PipelineStageFlagBits2::eFragmentShader,
+      .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+      .oldLayout     = vk::ImageLayout::eDepthAttachmentOptimal,
+      .newLayout     = vk::ImageLayout::eDepthReadOnlyOptimal,
+      .image         = *csm.images[c],
+      .subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}
+    };
+    barriers.push_back(barrier);
+    csm.layouts[c] = vk::ImageLayout::eDepthReadOnlyOptimal;
+  }
+  vk::DependencyInfo depInfo2{
+    .imageMemoryBarrierCount = (uint32_t)barriers.size(),
+    .pImageMemoryBarriers    = barriers.data()
+  };
+  cmd.pipelineBarrier2(depInfo2);
+}
+
+void Renderer::renderSkyPass(vk::raii::CommandBuffer& cmd, CameraComponent* camera) {
+  if (!enableSky || !*skyPipeline || !camera) return;
+
+  vk::RenderingAttachmentInfo colorAttachment{
+    .imageView   = *opaqueSceneColorImageViews[currentFrame],
+    .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
+    .loadOp      = vk::AttachmentLoadOp::eLoad,
+    .storeOp     = vk::AttachmentStoreOp::eStore
+  };
+  // Use depth in read-only mode (depth test Equal, no write)
+  vk::RenderingAttachmentInfo depthAttachment{
+    .imageView   = *depthImageView,
+    .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal,
+    .loadOp      = vk::AttachmentLoadOp::eLoad,
+    .storeOp     = vk::AttachmentStoreOp::eDontCare
+  };
+  vk::RenderingInfo renderingInfo{
+    .renderArea               = {{0,0}, swapChainExtent},
+    .layerCount               = 1,
+    .colorAttachmentCount     = 1,
+    .pColorAttachments        = &colorAttachment,
+    .pDepthAttachment         = &depthAttachment
+  };
+  cmd.beginRendering(renderingInfo);
+
+  vk::Viewport vp{0, 0, (float)swapChainExtent.width, (float)swapChainExtent.height, 0.0f, 1.0f};
+  vk::Rect2D sc{{0,0}, swapChainExtent};
+  cmd.setViewport(0, vp);
+  cmd.setScissor(0, sc);
+  cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *skyPipeline);
+
+  // Bind env map descriptor set (set 0) — always present (placeholder when no env texture)
+  if (*skyDescriptorSet)
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *skyPipelineLayout, 0, {*skyDescriptorSet}, {});
+
+  glm::mat4 view = camera->GetViewMatrix();
+  glm::mat4 proj = camera->GetProjectionMatrix();
+  proj[1][1] *= -1.0f;  // Vulkan Y-flip — must match the main scene UBO convention
+  SkyPushConstants pc{};
+  // Strip translation from view so sky colour is rotation-only (infinite distance).
+  pc.invViewProj  = glm::inverse(proj * glm::mat4(glm::mat3(view)));
+  pc.sunDirection = glm::normalize(sunDirection);
+  pc.turbidity    = sunTurbidity;
+  pc.groundColor  = glm::vec3(0.08f, 0.07f, 0.06f);
+  pc.sunIntensity = sunIntensity;
+  pc.sunDiscAngle = std::cos(glm::radians(3.0f));   // 3° radius — visually obvious disc
+  pc.useEnvMap    = (hasEnvTexture && useEnvMapForSky) ? 1u : 0u;
+  pc._pad[0] = pc._pad[1] = 0.0f;
+
+  cmd.pushConstants<SkyPushConstants>(*skyPipelineLayout,
+    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+  cmd.draw(3, 1, 0, 0);
+  cmd.endRendering();
+}
+
+void Renderer::updateCSMDescriptorSetsGlobal(uint32_t frameIndex) {
+  if (csmFrames.empty() || frameIndex >= csmFrames.size()) return;
+  auto& csm = csmFrames[frameIndex];
+
+  // Prepare image infos for binding 14 (3 cascade shadow maps)
+  std::array<vk::DescriptorImageInfo, CSM_CASCADE_COUNT> imgInfos;
+  for (uint32_t c = 0; c < CSM_CASCADE_COUNT; c++) {
+    imgInfos[c] = vk::DescriptorImageInfo{
+      .sampler     = *csm.shadowSampler,
+      .imageView   = *csm.views[c],
+      .imageLayout = vk::ImageLayout::eDepthReadOnlyOptimal
+    };
+  }
+
+  vk::DescriptorBufferInfo bufInfo{
+    .buffer = *csm.uboBuffer,
+    .offset = 0,
+    .range  = sizeof(CsmUBO)
+  };
+
+  for (auto& [entity, res] : entityResources) {
+    if (res.pbrDescriptorSets.size() <= frameIndex) continue;
+    auto& ds = res.pbrDescriptorSets[frameIndex];
+    if (!*ds) continue;
+
+    vk::WriteDescriptorSet w14{
+      .dstSet          = *ds,
+      .dstBinding      = 14,
+      .descriptorCount = CSM_CASCADE_COUNT,
+      .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+      .pImageInfo      = imgInfos.data()
+    };
+    vk::WriteDescriptorSet w15{
+      .dstSet          = *ds,
+      .dstBinding      = 15,
+      .descriptorCount = 1,
+      .descriptorType  = vk::DescriptorType::eUniformBuffer,
+      .pBufferInfo     = &bufInfo
+    };
+    device.updateDescriptorSets({w14, w15}, {});
+  }
 }

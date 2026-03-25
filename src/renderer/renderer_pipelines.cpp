@@ -188,17 +188,37 @@ bool Renderer::createPBRDescriptorSetLayout() {
         .descriptorCount = 1,
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .pImmutableSamplers = nullptr
+      },
+      // Binding 14: CSM shadow maps (3 cascades, comparison sampler)
+      vk::DescriptorSetLayoutBinding{
+        .binding = 14,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = CSM_CASCADE_COUNT,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .pImmutableSamplers = nullptr
+      },
+      // Binding 15: CSM UBO (light space matrices + cascade splits + shadow params)
+      vk::DescriptorSetLayoutBinding{
+        .binding = 15,
+        .descriptorType = vk::DescriptorType::eUniformBuffer,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .pImmutableSamplers = nullptr
       }
     };
 
     // Create a descriptor set layout
     // Descriptor indexing: set per-binding flags for UPDATE_AFTER_BIND on UBO (0) and sampled images (1..5)
     vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
-    std::array<vk::DescriptorBindingFlags, 14> bindingFlags{};
+    std::array<vk::DescriptorBindingFlags, 16> bindingFlags{};
     if (descriptorIndexingEnabled) {
       bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[1] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[10] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+      // Binding 11 (TLAS) is partially bound: on non-RT hardware we skip writing it,
+      // which is spec-legal only when ePartiallyBound is set.
+      bindingFlags[11] = vk::DescriptorBindingFlagBits::ePartiallyBound;
+      // Bindings 14 and 15 (CSM) do NOT use eUpdateAfterBind for Maxwell compatibility
       bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
       bindingFlagsInfo.pBindingFlags = bindingFlags.data();
     }
@@ -846,11 +866,11 @@ bool Renderer::createDepthPrepassPipeline() {
       }
     }
 
-    // Read PBR shader (vertex only)
-    auto shaderCode = readFile("shaders/pbr.spv");
+    // Read PBR vertex shader (Slang entry point: vsmain)
+    auto shaderCode = readFile("shaders/pbr_vsmain.spv");
     vk::raii::ShaderModule shaderModule = createShaderModule(shaderCode);
 
-    // Stages: Vertex only
+    // Stages: Vertex only (depth pre-pass writes depth, no color output)
     vk::PipelineShaderStageCreateInfo vertStage{
       .stage = vk::ShaderStageFlagBits::eVertex,
       .module = *shaderModule,
@@ -1266,13 +1286,13 @@ bool Renderer::createRayQueryResources() {
         rqFormat = vk::Format::eR8G8B8A8Unorm;
       }
     }
-    auto [image, allocation] = memoryPool->createImage(
+    auto [image, allocation] = createVmaImage(
       swapChainExtent.width,
       swapChainExtent.height,
       rqFormat,
       vk::ImageTiling::eOptimal,
       vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
-      vk::MemoryPropertyFlagBits::eDeviceLocal,
+      VMA_MEMORY_USAGE_GPU_ONLY,
       1,
       // mipLevels
       vk::SharingMode::eExclusive,
@@ -1280,7 +1300,7 @@ bool Renderer::createRayQueryResources() {
     );
 
     rayQueryOutputImage = std::move(image);
-    rayQueryOutputImageAllocation = std::move(allocation);
+    rayQueryOutputImageAllocation = allocation;
 
     // Create image view
     vk::ImageViewCreateInfo viewInfo{};
@@ -1389,20 +1409,675 @@ bool Renderer::createRayQueryResources() {
     rayQueryUniformBuffersMapped.clear();
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-      auto [uboBuffer, uboAlloc] = createBufferPooled(
+      auto [uboBuffer, uboAlloc] = createVmaBuffer(
         sizeof(RayQueryUniformBufferObject),
         vk::BufferUsageFlagBits::eUniformBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
       rayQueryUniformBuffers.push_back(std::move(uboBuffer));
-      rayQueryUniformAllocations.push_back(std::move(uboAlloc));
-      rayQueryUniformBuffersMapped.push_back(rayQueryUniformAllocations.back()->mappedPtr);
+      rayQueryUniformAllocations.push_back(uboAlloc);
+      {
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(vmaAllocator, uboAlloc, &info);
+        rayQueryUniformBuffersMapped.push_back(info.pMappedData);
+      }
     }
 
     std::cout << "Ray query resources created successfully (including " << MAX_FRAMES_IN_FLIGHT << " dedicated UBOs)\n";
     return true;
   } catch (const std::exception& e) {
     std::cerr << "Failed to create ray query resources: " << e.what() << std::endl;
+    return false;
+  }
+}
+bool Renderer::createSkyPipeline() {
+  try {
+    // Destroy old sky descriptor resources in reverse-dependency order before recreating.
+    // (The RAII pool destructor fires while the set RAII still holds a handle to that pool,
+    //  causing vkFreeDescriptorSets on an already-destroyed pool on the second call.)
+    skyDescriptorSet         = vk::raii::DescriptorSet(nullptr);
+    skyDescriptorPool        = vk::raii::DescriptorPool(nullptr);
+    skyDescriptorSetLayout   = vk::raii::DescriptorSetLayout(nullptr);
+    skyPipelineLayout        = vk::raii::PipelineLayout(nullptr);
+    skyPipeline              = vk::raii::Pipeline(nullptr);
+
+    // --- Descriptor set layout: binding 0 = combined image sampler (env map) ---
+    vk::DescriptorSetLayoutBinding envBinding{
+      .binding         = 0,
+      .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+      .descriptorCount = 1,
+      .stageFlags      = vk::ShaderStageFlagBits::eFragment
+    };
+    vk::DescriptorSetLayoutCreateInfo dslCI{
+      .bindingCount = 1,
+      .pBindings    = &envBinding
+    };
+    skyDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, dslCI);
+
+    // --- Descriptor pool (1 set, 1 combined image sampler) ---
+    vk::DescriptorPoolSize poolSize{
+      .type            = vk::DescriptorType::eCombinedImageSampler,
+      .descriptorCount = 1
+    };
+    vk::DescriptorPoolCreateInfo poolCI{
+      .flags         = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+      .maxSets       = 1,
+      .poolSizeCount = 1,
+      .pPoolSizes    = &poolSize
+    };
+    skyDescriptorPool = vk::raii::DescriptorPool(device, poolCI);
+
+    // --- Allocate descriptor set ---
+    vk::DescriptorSetLayout dslHandle = *skyDescriptorSetLayout;
+    vk::DescriptorSetAllocateInfo dsAllocInfo{
+      .descriptorPool     = *skyDescriptorPool,
+      .descriptorSetCount = 1,
+      .pSetLayouts        = &dslHandle
+    };
+    vk::raii::DescriptorSets dsets(device, dsAllocInfo);
+    skyDescriptorSet = std::move(dsets[0]);
+
+    // Write descriptor set with the default 1x1 texture as placeholder until env map loads
+    {
+      vk::DescriptorImageInfo imgInfo{
+        .sampler     = *defaultTextureResources.textureSampler,
+        .imageView   = *defaultTextureResources.textureImageView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::WriteDescriptorSet write{
+        .dstSet          = *skyDescriptorSet,
+        .dstBinding      = 0,
+        .descriptorCount = 1,
+        .descriptorType  = vk::DescriptorType::eCombinedImageSampler,
+        .pImageInfo      = &imgInfo
+      };
+      device.updateDescriptorSets(write, {});
+    }
+
+    // Push constant range: SkyPushConstants (mat4=64 + 48 = 112 bytes total)
+    vk::PushConstantRange pushRange{
+      .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+      .offset = 0,
+      .size = sizeof(SkyPushConstants)
+    };
+    vk::DescriptorSetLayout skyDslHandle = *skyDescriptorSetLayout;
+    vk::PipelineLayoutCreateInfo layoutInfo{
+      .setLayoutCount         = 1,
+      .pSetLayouts            = &skyDslHandle,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges    = &pushRange
+    };
+    skyPipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
+
+    auto vertCode = readFile("shaders/sky_vsmain.spv");
+    auto fragCode = readFile("shaders/sky_psmain.spv");
+    vk::raii::ShaderModule vertMod = createShaderModule(vertCode);
+    vk::raii::ShaderModule fragMod = createShaderModule(fragCode);
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {
+      {.stage = vk::ShaderStageFlagBits::eVertex,   .module = *vertMod, .pName = "main"},
+      {.stage = vk::ShaderStageFlagBits::eFragment, .module = *fragMod, .pName = "main"}
+    };
+
+    vk::PipelineVertexInputStateCreateInfo vertexInput{
+      .vertexBindingDescriptionCount   = 0,
+      .vertexAttributeDescriptionCount = 0
+    };
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eTriangleList
+    };
+    vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+    vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode    = vk::CullModeFlagBits::eNone,
+      .frontFace   = vk::FrontFace::eCounterClockwise,
+      .lineWidth   = 1.0f
+    };
+    vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1
+    };
+    // Depth test EQUAL (only draw sky on far plane pixels), no depth write
+    vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable  = vk::True,
+      .depthWriteEnable = vk::False,
+      .depthCompareOp   = vk::CompareOp::eEqual
+    };
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .blendEnable    = vk::False,
+      .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+    };
+    vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .attachmentCount = 1,
+      .pAttachments    = &colorBlendAttachment
+    };
+    std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = (uint32_t)dynamicStates.size(),
+      .pDynamicStates    = dynamicStates.data()
+    };
+
+    vk::Format depthFmt = findDepthFormat();
+    vk::PipelineRenderingCreateInfo renderingInfo{
+      .colorAttachmentCount    = 1,
+      .pColorAttachmentFormats = &swapChainImageFormat,
+      .depthAttachmentFormat   = depthFmt
+    };
+
+    vk::GraphicsPipelineCreateInfo pipelineInfo{
+      .pNext               = &renderingInfo,
+      .stageCount          = 2,
+      .pStages             = stages,
+      .pVertexInputState   = &vertexInput,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState      = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState   = &multisampling,
+      .pDepthStencilState  = &depthStencil,
+      .pColorBlendState    = &colorBlending,
+      .pDynamicState       = &dynamicState,
+      .layout              = *skyPipelineLayout
+    };
+    skyPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    std::cout << "[Sky] Sky pipeline created successfully\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create sky pipeline: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+bool Renderer::createWaterPipeline() {
+  try {
+    // ---- Descriptor set layout ----
+    // binding 0: WaterVertexUBO (vertex)
+    // binding 1: WaterFragUBO   (fragment)
+    // binding 2: displacement map (frag + vert sampler)
+    // binding 3: normal map (frag + vert sampler)
+    // binding 4: env/sky equirectangular map (fragment — reflections)
+    std::array<vk::DescriptorSetLayoutBinding, 5> dslBindings = {{
+      {.binding=0, .descriptorType=vk::DescriptorType::eUniformBuffer,
+       .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eVertex},
+      {.binding=1, .descriptorType=vk::DescriptorType::eUniformBuffer,
+       .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eFragment},
+      {.binding=2, .descriptorType=vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment},
+      {.binding=3, .descriptorType=vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment},
+      {.binding=4, .descriptorType=vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount=1, .stageFlags=vk::ShaderStageFlagBits::eFragment},
+    }};
+    vk::DescriptorSetLayoutCreateInfo dslInfo{
+      .bindingCount = static_cast<uint32_t>(dslBindings.size()),
+      .pBindings    = dslBindings.data()
+    };
+    waterDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, dslInfo);
+
+    vk::DescriptorSetLayout dslHandle = *waterDescriptorSetLayout;
+    vk::PipelineLayoutCreateInfo layoutCI{
+      .setLayoutCount = 1,
+      .pSetLayouts    = &dslHandle
+    };
+    waterPipelineLayout = vk::raii::PipelineLayout(device, layoutCI);
+
+    // ---- Shaders ----
+    auto vertCode = readFile("shaders/water_vsmain.spv");
+    auto fragCode = readFile("shaders/water_psmain.spv");
+    vk::raii::ShaderModule vertMod = createShaderModule(vertCode);
+    vk::raii::ShaderModule fragMod = createShaderModule(fragCode);
+
+    vk::PipelineShaderStageCreateInfo stages[2] = {
+      {.stage = vk::ShaderStageFlagBits::eVertex,   .module = *vertMod, .pName = "main"},
+      {.stage = vk::ShaderStageFlagBits::eFragment, .module = *fragMod, .pName = "main"}
+    };
+
+    // ---- Vertex input: WaterVertex { vec3 pos, vec2 uv } ----
+    vk::VertexInputBindingDescription vtxBinding{
+      .binding   = 0,
+      .stride    = sizeof(float) * 5, // vec3 + vec2
+      .inputRate = vk::VertexInputRate::eVertex
+    };
+    std::array<vk::VertexInputAttributeDescription, 2> vtxAttribs = {{
+      {.location=0, .binding=0, .format=vk::Format::eR32G32B32Sfloat, .offset=0},
+      {.location=1, .binding=0, .format=vk::Format::eR32G32Sfloat,    .offset=sizeof(float)*3},
+    }};
+    vk::PipelineVertexInputStateCreateInfo vertexInput{
+      .vertexBindingDescriptionCount   = 1,
+      .pVertexBindingDescriptions      = &vtxBinding,
+      .vertexAttributeDescriptionCount = static_cast<uint32_t>(vtxAttribs.size()),
+      .pVertexAttributeDescriptions    = vtxAttribs.data()
+    };
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+    vk::PipelineViewportStateCreateInfo viewportState{.viewportCount=1, .scissorCount=1};
+    vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode    = vk::CullModeFlagBits::eNone,
+      .frontFace   = vk::FrontFace::eCounterClockwise,
+      .lineWidth   = 1.0f
+    };
+    vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1
+    };
+    vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable  = vk::True,
+      .depthWriteEnable = vk::True,
+      .depthCompareOp   = vk::CompareOp::eLess
+    };
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .blendEnable    = vk::False,
+      .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+    };
+    vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .attachmentCount = 1,
+      .pAttachments    = &colorBlendAttachment
+    };
+    std::vector<vk::DynamicState> dynamicStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = (uint32_t)dynamicStates.size(),
+      .pDynamicStates    = dynamicStates.data()
+    };
+    vk::Format depthFmt = findDepthFormat();
+    vk::PipelineRenderingCreateInfo renderingInfo{
+      .colorAttachmentCount    = 1,
+      .pColorAttachmentFormats = &swapChainImageFormat,
+      .depthAttachmentFormat   = depthFmt
+    };
+    vk::GraphicsPipelineCreateInfo pipelineInfo{
+      .pNext               = &renderingInfo,
+      .stageCount          = 2,
+      .pStages             = stages,
+      .pVertexInputState   = &vertexInput,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState      = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState   = &multisampling,
+      .pDepthStencilState  = &depthStencil,
+      .pColorBlendState    = &colorBlending,
+      .pDynamicState       = &dynamicState,
+      .layout              = *waterPipelineLayout
+    };
+    waterPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    std::cout << "[Water] Water pipeline created successfully\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create water pipeline: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+bool Renderer::createCSMDepthPipeline() {
+  try {
+    // Descriptor set layout: binding 0 = CsmDepthUBO (vertex stage)
+    vk::DescriptorSetLayoutBinding uboBinding{
+      .binding         = 0,
+      .descriptorType  = vk::DescriptorType::eUniformBuffer,
+      .descriptorCount = 1,
+      .stageFlags      = vk::ShaderStageFlagBits::eVertex
+    };
+    vk::DescriptorSetLayoutCreateInfo dslInfo{
+      .bindingCount = 1,
+      .pBindings    = &uboBinding
+    };
+    csmDepthDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, dslInfo);
+
+    // Push constants: model matrix (64) + cascade index (4) + pad (12)
+    vk::PushConstantRange pushRange{
+      .stageFlags = vk::ShaderStageFlagBits::eVertex,
+      .offset     = 0,
+      .size       = 80  // 64 + 4 + 12 pad
+    };
+    vk::DescriptorSetLayout dslHandle = *csmDepthDescriptorSetLayout;
+    vk::PipelineLayoutCreateInfo layoutInfo{
+      .setLayoutCount         = 1,
+      .pSetLayouts            = &dslHandle,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges    = &pushRange
+    };
+    csmDepthPipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
+
+    auto vertCode = readFile("shaders/csm_depth_vsmain.spv");
+    vk::raii::ShaderModule vertMod = createShaderModule(vertCode);
+    vk::PipelineShaderStageCreateInfo stage{
+      .stage  = vk::ShaderStageFlagBits::eVertex,
+      .module = *vertMod,
+      .pName  = "main"
+    };
+
+    // Vertex input: position only (first attribute, binding 0)
+    vk::VertexInputBindingDescription vtxBinding{
+      .binding   = 0,
+      .stride    = sizeof(Vertex),
+      .inputRate = vk::VertexInputRate::eVertex
+    };
+    vk::VertexInputAttributeDescription vtxAttr{
+      .location = 0,
+      .binding  = 0,
+      .format   = vk::Format::eR32G32B32Sfloat,
+      .offset   = offsetof(Vertex, position)
+    };
+    vk::PipelineVertexInputStateCreateInfo vtxInput{
+      .vertexBindingDescriptionCount   = 1,
+      .pVertexBindingDescriptions      = &vtxBinding,
+      .vertexAttributeDescriptionCount = 1,
+      .pVertexAttributeDescriptions    = &vtxAttr
+    };
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly{.topology = vk::PrimitiveTopology::eTriangleList};
+    vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+    vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .polygonMode     = vk::PolygonMode::eFill,
+      .cullMode        = vk::CullModeFlagBits::eBack,
+      .frontFace       = vk::FrontFace::eCounterClockwise,
+      .depthBiasEnable = vk::True,
+      .lineWidth       = 1.0f
+    };
+    vk::PipelineMultisampleStateCreateInfo multisampling{.rasterizationSamples = vk::SampleCountFlagBits::e1};
+    vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable  = vk::True,
+      .depthWriteEnable = vk::True,
+      .depthCompareOp   = vk::CompareOp::eLessOrEqual
+    };
+    vk::PipelineColorBlendStateCreateInfo colorBlending{.attachmentCount = 0};
+    std::vector<vk::DynamicState> dynamicStates = {
+      vk::DynamicState::eViewport, vk::DynamicState::eScissor, vk::DynamicState::eDepthBias
+    };
+    vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = (uint32_t)dynamicStates.size(),
+      .pDynamicStates    = dynamicStates.data()
+    };
+    vk::Format depthFmt = vk::Format::eD32Sfloat;
+    vk::PipelineRenderingCreateInfo renderingInfo{
+      .depthAttachmentFormat = depthFmt
+    };
+    vk::GraphicsPipelineCreateInfo pipelineInfo{
+      .pNext               = &renderingInfo,
+      .stageCount          = 1,
+      .pStages             = &stage,
+      .pVertexInputState   = &vtxInput,
+      .pInputAssemblyState = &inputAssembly,
+      .pViewportState      = &viewportState,
+      .pRasterizationState = &rasterizer,
+      .pMultisampleState   = &multisampling,
+      .pDepthStencilState  = &depthStencil,
+      .pColorBlendState    = &colorBlending,
+      .pDynamicState       = &dynamicState,
+      .layout              = *csmDepthPipelineLayout
+    };
+    csmDepthPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    std::cout << "[CSM] CSM depth pipeline created successfully\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create CSM depth pipeline: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+// =============================================================================
+// Bloom pipelines [Jimenez 2014] — dual-Kawase downsample + tent upsample
+// =============================================================================
+bool Renderer::createBloomPipelines() {
+  try {
+    bloomDownsamplePipeline = vk::raii::Pipeline(nullptr);
+    bloomUpsamplePipeline   = vk::raii::Pipeline(nullptr);
+    bloomPipelineLayout     = vk::raii::PipelineLayout(nullptr);
+    bloomDescriptorSetLayout = vk::raii::DescriptorSetLayout(nullptr);
+
+    // --- Descriptor set layout ---
+    // binding 0 = source image (srcImage), binding 1 = add image (addImage / unused in downsample)
+    std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+      {.binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      {.binding = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment}
+    }};
+    vk::DescriptorSetLayoutCreateInfo dslCI{
+      .bindingCount = static_cast<uint32_t>(bindings.size()),
+      .pBindings    = bindings.data()
+    };
+    bloomDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, dslCI);
+
+    // Push constant: BloomPush (32 bytes)
+    vk::PushConstantRange pushRange{
+      .stageFlags = vk::ShaderStageFlagBits::eFragment,
+      .offset = 0,
+      .size   = 32  // float2 texelSize + int mipLevel + float threshold + float strength + float3 _pad
+    };
+    vk::DescriptorSetLayout dslHandle = *bloomDescriptorSetLayout;
+    vk::PipelineLayoutCreateInfo plCI{
+      .setLayoutCount         = 1,
+      .pSetLayouts            = &dslHandle,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges    = &pushRange
+    };
+    bloomPipelineLayout = vk::raii::PipelineLayout(device, plCI);
+
+    // --- Shared pipeline state ---
+    vk::PipelineVertexInputStateCreateInfo vertexInput{
+      .vertexBindingDescriptionCount   = 0,
+      .vertexAttributeDescriptionCount = 0
+    };
+    vk::PipelineInputAssemblyStateCreateInfo inputAssembly{
+      .topology = vk::PrimitiveTopology::eTriangleList
+    };
+    vk::PipelineViewportStateCreateInfo viewportState{.viewportCount = 1, .scissorCount = 1};
+    vk::PipelineRasterizationStateCreateInfo rasterizer{
+      .polygonMode = vk::PolygonMode::eFill,
+      .cullMode    = vk::CullModeFlagBits::eNone,
+      .frontFace   = vk::FrontFace::eCounterClockwise,
+      .lineWidth   = 1.0f
+    };
+    vk::PipelineMultisampleStateCreateInfo multisampling{
+      .rasterizationSamples = vk::SampleCountFlagBits::e1
+    };
+    vk::PipelineDepthStencilStateCreateInfo depthStencil{
+      .depthTestEnable  = vk::False,
+      .depthWriteEnable = vk::False
+    };
+    vk::PipelineColorBlendAttachmentState colorBlendAttachment{
+      .blendEnable    = vk::False,
+      .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+    };
+    vk::PipelineColorBlendStateCreateInfo colorBlending{
+      .attachmentCount = 1,
+      .pAttachments    = &colorBlendAttachment
+    };
+    std::vector<vk::DynamicState> dynStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+    vk::PipelineDynamicStateCreateInfo dynamicState{
+      .dynamicStateCount = (uint32_t)dynStates.size(),
+      .pDynamicStates    = dynStates.data()
+    };
+
+    // Bloom renders into R16G16B16A16_SFLOAT off-screen images
+    vk::Format bloomFmt = vk::Format::eR16G16B16A16Sfloat;
+    vk::PipelineRenderingCreateInfo renderingInfo{
+      .colorAttachmentCount    = 1,
+      .pColorAttachmentFormats = &bloomFmt,
+      .depthAttachmentFormat   = vk::Format::eUndefined
+    };
+
+    // Shared vertex shader
+    auto vertCode = readFile("shaders/bloom_vsmain.spv");
+    vk::raii::ShaderModule vertMod = createShaderModule(vertCode);
+
+    // --- Downsample pipeline ---
+    {
+      auto fragCode = readFile("shaders/bloom_downsampleps.spv");
+      vk::raii::ShaderModule fragMod = createShaderModule(fragCode);
+      vk::PipelineShaderStageCreateInfo stages[2] = {
+        {.stage = vk::ShaderStageFlagBits::eVertex,   .module = *vertMod, .pName = "main"},
+        {.stage = vk::ShaderStageFlagBits::eFragment, .module = *fragMod, .pName = "main"}
+      };
+      vk::GraphicsPipelineCreateInfo pipeCI{
+        .pNext               = &renderingInfo,
+        .stageCount          = 2,
+        .pStages             = stages,
+        .pVertexInputState   = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState      = &viewportState,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState   = &multisampling,
+        .pDepthStencilState  = &depthStencil,
+        .pColorBlendState    = &colorBlending,
+        .pDynamicState       = &dynamicState,
+        .layout              = *bloomPipelineLayout
+      };
+      bloomDownsamplePipeline = vk::raii::Pipeline(device, nullptr, pipeCI);
+    }
+
+    // --- Upsample pipeline ---
+    {
+      auto fragCode = readFile("shaders/bloom_upsampleps.spv");
+      vk::raii::ShaderModule fragMod = createShaderModule(fragCode);
+      vk::PipelineShaderStageCreateInfo stages[2] = {
+        {.stage = vk::ShaderStageFlagBits::eVertex,   .module = *vertMod, .pName = "main"},
+        {.stage = vk::ShaderStageFlagBits::eFragment, .module = *fragMod, .pName = "main"}
+      };
+      vk::GraphicsPipelineCreateInfo pipeCI{
+        .pNext               = &renderingInfo,
+        .stageCount          = 2,
+        .pStages             = stages,
+        .pVertexInputState   = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState      = &viewportState,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState   = &multisampling,
+        .pDepthStencilState  = &depthStencil,
+        .pColorBlendState    = &colorBlending,
+        .pDynamicState       = &dynamicState,
+        .layout              = *bloomPipelineLayout
+      };
+      bloomUpsamplePipeline = vk::raii::Pipeline(device, nullptr, pipeCI);
+    }
+
+    // --- Additive blend pipeline: renders bloom contribution into opaqueSceneColorImages ---
+    // This is for additively compositing the final bloom mip into the HDR scene before tonemapping.
+    // The render target is R16G16B16A16_SFLOAT (same format as bloomMips).
+    {
+      auto fragCode = readFile("shaders/bloom_addps.spv");
+      vk::raii::ShaderModule fragMod = createShaderModule(fragCode);
+      vk::PipelineShaderStageCreateInfo stages[2] = {
+        {.stage = vk::ShaderStageFlagBits::eVertex,   .module = *vertMod, .pName = "main"},
+        {.stage = vk::ShaderStageFlagBits::eFragment, .module = *fragMod, .pName = "main"}
+      };
+      // Additive blending: output = dst + src * strength
+      vk::PipelineColorBlendAttachmentState addBlend{
+        .blendEnable         = vk::True,
+        .srcColorBlendFactor = vk::BlendFactor::eOne,
+        .dstColorBlendFactor = vk::BlendFactor::eOne,
+        .colorBlendOp        = vk::BlendOp::eAdd,
+        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+        .alphaBlendOp        = vk::BlendOp::eAdd,
+        .colorWriteMask      = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                               vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+      };
+      vk::PipelineColorBlendStateCreateInfo addBlending{.attachmentCount = 1, .pAttachments = &addBlend};
+      // The render target for the bloom add pass is opaqueSceneColorImages (same format as swapchain)
+      vk::PipelineRenderingCreateInfo hdrRenderingInfo{
+        .colorAttachmentCount    = 1,
+        .pColorAttachmentFormats = &swapChainImageFormat,
+        .depthAttachmentFormat   = vk::Format::eUndefined
+      };
+      vk::GraphicsPipelineCreateInfo pipeCI{
+        .pNext               = &hdrRenderingInfo,
+        .stageCount          = 2,
+        .pStages             = stages,
+        .pVertexInputState   = &vertexInput,
+        .pInputAssemblyState = &inputAssembly,
+        .pViewportState      = &viewportState,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState   = &multisampling,
+        .pDepthStencilState  = &depthStencil,
+        .pColorBlendState    = &addBlending,
+        .pDynamicState       = &dynamicState,
+        .layout              = *bloomPipelineLayout
+      };
+      bloomAddPipeline = vk::raii::Pipeline(device, nullptr, pipeCI);
+    }
+
+    std::cout << "[Bloom] Bloom pipelines created.\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[Bloom] Failed to create bloom pipelines: " << e.what() << "\n";
+    return false;
+  }
+}
+
+// =============================================================================
+// Histogram auto-exposure compute pipelines [Chapelle 2018]
+// =============================================================================
+bool Renderer::createExposurePipelines() {
+  try {
+    exposureHistogramPipeline  = vk::raii::Pipeline(nullptr);
+    exposureReducePipeline     = vk::raii::Pipeline(nullptr);
+    exposurePipelineLayout     = vk::raii::PipelineLayout(nullptr);
+    exposureDescriptorSetLayout = vk::raii::DescriptorSetLayout(nullptr);
+
+    // --- Descriptor set layout ---
+    // binding 0 = sceneColor (combined image sampler, read-only)
+    // binding 1 = histogram SSBO (RWStructuredBuffer<uint>)
+    // binding 2 = exposureBuffer SSBO (RWStructuredBuffer<float>)
+    std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
+      {.binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+       .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+      {.binding = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,
+       .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+      {.binding = 2, .descriptorType = vk::DescriptorType::eStorageBuffer,
+       .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+    }};
+    vk::DescriptorSetLayoutCreateInfo dslCI{
+      .bindingCount = static_cast<uint32_t>(bindings.size()),
+      .pBindings    = bindings.data()
+    };
+    exposureDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, dslCI);
+
+    // Push constant: ExposurePush (48 bytes)
+    vk::PushConstantRange pushRange{
+      .stageFlags = vk::ShaderStageFlagBits::eCompute,
+      .offset = 0,
+      .size   = 48
+    };
+    vk::DescriptorSetLayout dslHandle = *exposureDescriptorSetLayout;
+    vk::PipelineLayoutCreateInfo plCI{
+      .setLayoutCount         = 1,
+      .pSetLayouts            = &dslHandle,
+      .pushConstantRangeCount = 1,
+      .pPushConstantRanges    = &pushRange
+    };
+    exposurePipelineLayout = vk::raii::PipelineLayout(device, plCI);
+
+    // BuildHistogramCS
+    {
+      auto code = readFile("shaders/exposure_buildhistogramcs.spv");
+      vk::raii::ShaderModule mod = createShaderModule(code);
+      vk::PipelineShaderStageCreateInfo stage{
+        .stage  = vk::ShaderStageFlagBits::eCompute,
+        .module = *mod,
+        .pName  = "main"
+      };
+      vk::ComputePipelineCreateInfo pipeCI{.stage = stage, .layout = *exposurePipelineLayout};
+      exposureHistogramPipeline = vk::raii::Pipeline(device, nullptr, pipeCI);
+    }
+
+    // ReduceHistogramCS
+    {
+      auto code = readFile("shaders/exposure_reducehistogramcs.spv");
+      vk::raii::ShaderModule mod = createShaderModule(code);
+      vk::PipelineShaderStageCreateInfo stage{
+        .stage  = vk::ShaderStageFlagBits::eCompute,
+        .module = *mod,
+        .pName  = "main"
+      };
+      vk::ComputePipelineCreateInfo pipeCI{.stage = stage, .layout = *exposurePipelineLayout};
+      exposureReducePipeline = vk::raii::Pipeline(device, nullptr, pipeCI);
+    }
+
+    std::cout << "[Exposure] Auto-exposure compute pipelines created.\n";
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[Exposure] Failed to create exposure pipelines: " << e.what() << "\n";
     return false;
   }
 }

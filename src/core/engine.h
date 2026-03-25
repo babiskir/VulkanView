@@ -17,6 +17,7 @@
 #pragma once
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -34,6 +35,7 @@
 #include "platform.h"
 #include "renderer.h"
 #include "resource_manager.h"
+#include "update_publisher.h"
 
 /**
  * @brief Main engine class that manages the game loop and subsystems.
@@ -123,6 +125,7 @@ class Engine
 	 * @return A pointer to the active camera component, or nullptr if none is set.
 	 */
 	const CameraComponent *GetActiveCamera() const;
+	CameraComponent *GetActiveCamera();
 
 	/**
 	 * @brief Get the resource manager.
@@ -165,6 +168,46 @@ class Engine
 	 * @return A pointer to the ImGui system.
 	 */
 	const ImGuiSystem *GetImGuiSystem() const;
+	ImGuiSystem *GetImGuiSystem();
+
+	/**
+	 * @brief Register a UI callback rendered each frame while no scene is loaded.
+	 *        The callback should use ImGui:: calls to build a scene-picker overlay.
+	 *        Pass nullptr to clear it.
+	 */
+	/** Register a UI callback rendered each frame while no scene is loaded.
+	 *  Automatically forwarded to ImGuiSystem. Pass nullptr to clear. */
+	void SetScenePicker(std::function<void()> callback);
+	const std::function<void()>& GetScenePicker() const { return scenePickerUI; }
+	/** Mark that a scene has been chosen so the picker stops rendering. */
+	void SetSceneLoaded(bool loaded) { sceneLoaded = loaded; }
+	bool IsSceneLoaded() const { return sceneLoaded; }
+
+	/** Queue a scene-load function to be called safely between frames. */
+	void SetPendingSceneLoader(std::function<void()> loader) { pendingSceneLoader = std::move(loader); }
+
+	/** Destroy all entities and clear physics actor registrations so the next scene
+	 *  starts from a clean state.  Call this at the top of each scene loader. */
+	void ClearScene();
+
+	/** Register a per-frame scene UI callback (drawn after the scene loads).
+	 *  Use this from scene loaders to install persistent editor panels.
+	 *  Pass nullptr to clear. */
+	void SetSceneUI(std::function<void()> callback);
+
+	// -----------------------------------------------------------------------
+	// UpdatePublisher — scene-level subscriptions (cleared on ClearScene).
+	// Use these from scene loaders instead of stuffing logic into SetSceneUI.
+	// -----------------------------------------------------------------------
+	/** Subscribe a fixed-timestep callback for this scene (e.g. buoyancy forces). */
+	void SubscribeSceneFixedUpdate(std::function<void(float)> cb);
+	/** Subscribe a per-frame update callback for this scene. */
+	void SubscribeSceneUpdate     (std::function<void(float)> cb);
+	/** Subscribe a late-update callback for this scene (after Update). */
+	void SubscribeSceneLateUpdate (std::function<void(float)> cb);
+
+	/** Get the UpdatePublisher (for advanced scene use). */
+	UpdatePublisher* GetUpdatePublisher() { return updatePublisher.get(); }
 
 	/**
 	 * @brief Handles mouse input for interaction and camera control.
@@ -219,6 +262,7 @@ class Engine
 	std::unique_ptr<AudioSystem>     audioSystem;
 	std::unique_ptr<PhysicsSystem>   physicsSystem;
 	std::unique_ptr<ImGuiSystem>     imguiSystem;
+	std::unique_ptr<UpdatePublisher> updatePublisher;
 
 	// Entities
 	// NOTE: Entities can be created from a background loading thread (see `main.cpp`).
@@ -240,6 +284,14 @@ class Engine
 
 	// Active camera
 	CameraComponent *activeCamera = nullptr;
+
+	// Scene picker: rendered by ImGuiSystem each frame until a scene is chosen
+	std::function<void()> scenePickerUI;
+	bool sceneLoaded = false;
+
+	// Deferred scene loader: set by the picker callback, drained at the top of
+	// the next Run() iteration after WaitIdle so no GPU work is in flight.
+	std::function<void()> pendingSceneLoader;
 
 	// Engine state
 	bool initialized = false;

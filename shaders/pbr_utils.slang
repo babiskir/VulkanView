@@ -47,6 +47,22 @@ float3 FresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (1.0 - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
 
+// Analytical DFG approximation (Karis 2013 / Lazarov 2013)
+// Returns (A, B) where the GGX+Smith specular DFG integral ≈ F0*A + B
+// Used for multiscattering energy compensation [MA19]
+float2 EnvBRDFApprox(float roughness, float NdotV) {
+    const float4 c0 = float4(-1.0, -0.0275, -0.572, 0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.04, -0.04);
+    float4 r = roughness * c0 + c1;
+    float a004 = min(r.x * r.x, exp2(-9.28 * NdotV)) * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// Fresnel-Schlick with roughness term for IBL (Karis 2013)
+float3 FresnelSchlickRoughness(float cosTheta, float3 F0, float roughness) {
+    return F0 + (max(float3(1.0 - roughness), F0) - F0) * pow(saturate(1.0 - cosTheta), 5.0);
+}
+
 // Fresnel for dielectric materials (given IOR)
 float3 Fresnel_Dielectric(float cosTheta, float ior) {
     float r0 = (1.0 - ior) / (1.0 + ior);

@@ -69,6 +69,19 @@ struct VSOutput {
 [[vk::binding(12, 0)]] StructuredBuffer<GeometryInfo> geometryInfoBuffer;
 [[vk::binding(13, 0)]] StructuredBuffer<MaterialData> materialBuffer;
 
+// CSM shadow maps — 3 cascades (bound as combined image sampler with comparison sampler)
+[[vk::binding(14, 0)]] Sampler2D csmShadowMaps[3];
+
+// CSM UBO
+struct CsmUboData {
+    column_major float4x4 lightSpaceMatrices[3];
+    float4 cascadeSplits;   // x/y/z = view-space far per cascade
+    float4 shadowParams;    // x=bias, y=slopeScale, z=unused, w=enable
+    float4 sunDirection;    // xyz = normalized direction toward sun
+    float4 sunColor;        // xyz = color, w = intensity
+};
+[[vk::binding(15, 0)]] ConstantBuffer<CsmUboData> csmData;
+
 [[vk::push_constant]] PushConstants material;
 
 static const float RASTER_SHADOW_EPS = 0.001;
@@ -104,6 +117,45 @@ bool traceShadowOccluded(float3 origin, float3 direction, float tMin, float tMax
         // No special acceptance rules here; accept-first-hit will commit on the first opaque blocker.
     }
     return (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT);
+}
+
+// CSM shadow sampling with 3x3 PCF (manual comparison for Slang compatibility)
+float sampleCSMShadow(float3 worldPos, float4x4 viewMatrix) {
+    if (csmData.shadowParams.w < 0.5) return 1.0;
+
+    // Compute view-space Z for cascade selection
+    float4 viewPos = mul(viewMatrix, float4(worldPos, 1.0));
+    float viewSpaceZ = abs(viewPos.z);
+
+    // Select cascade
+    int cascade = 2;
+    if (viewSpaceZ < csmData.cascadeSplits.x) cascade = 0;
+    else if (viewSpaceZ < csmData.cascadeSplits.y) cascade = 1;
+
+    float4 lightSpacePos = mul(csmData.lightSpaceMatrices[cascade], float4(worldPos, 1.0));
+    float3 projCoords = lightSpacePos.xyz / lightSpacePos.w;
+    float2 shadowUV = projCoords.xy * 0.5 + 0.5;
+
+    // Out-of-bounds check
+    if (shadowUV.x < 0.0 || shadowUV.x > 1.0 || shadowUV.y < 0.0 || shadowUV.y > 1.0) return 1.0;
+    if (projCoords.z > 1.0 || projCoords.z < 0.0) return 1.0;
+
+    float currentDepth = projCoords.z - csmData.shadowParams.x;
+
+    // 3x3 PCF with manual comparison
+    float shadow = 0.0;
+    float2 texelSize = float2(1.0 / 1024.0, 1.0 / 1024.0);
+    for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+            float2 uv = shadowUV + float2(float(x), float(y)) * texelSize;
+            float shadowDepth;
+            if (cascade == 0)      shadowDepth = csmShadowMaps[0].Sample(uv).r;
+            else if (cascade == 1) shadowDepth = csmShadowMaps[1].Sample(uv).r;
+            else                   shadowDepth = csmShadowMaps[2].Sample(uv).r;
+            shadow += (shadowDepth >= currentDepth) ? 1.0 : 0.0;
+        }
+    }
+    return shadow / 9.0;
 }
 
 // Vertex shader entry point
@@ -288,7 +340,10 @@ float4 PSMain(VSOutput input) : SV_TARGET
                 // Raster ray-query shadows are expensive. In Bistro, most lights are emissive
                 // and casting per-light shadows drops FPS drastically. Shadow only the directional
                 // light (sun) for now.
-                if (ubo.padding2 != 0.0 && light.lightType == 1) {
+                // CSM shadows for directional lights (rasterized, no ray query needed)
+                if (light.lightType == 1 && csmData.shadowParams.w >= 0.5) {
+                    visibility = sampleCSMShadow(input.WorldPos, ubo.view);
+                } else if (ubo.padding2 != 0.0 && light.lightType == 1) {
                     float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
                     float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
                     bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
@@ -356,7 +411,10 @@ float4 PSMain(VSOutput input) : SV_TARGET
             float NdotL = (light.lightType == 3) ? abs(dot(N, L)) : max(dot(N, L), 0.0);
             if (NdotL > 0.0) {
                 float visibility = 1.0;
-                if (ubo.padding2 != 0.0 && light.lightType == 1) {
+                // CSM shadows for directional lights (rasterized, no ray query needed)
+                if (light.lightType == 1 && csmData.shadowParams.w >= 0.5) {
+                    visibility = sampleCSMShadow(input.WorldPos, ubo.view);
+                } else if (ubo.padding2 != 0.0 && light.lightType == 1) {
                     float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
                     float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
                     bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
@@ -378,7 +436,39 @@ float4 PSMain(VSOutput input) : SV_TARGET
         }
     }
 
-    float3 ambient = albedo * ao * (0.1 * ubo.scaleIBLAmbient);
+    // --- Sun directional light (driven by CSM UBO, independent of scene light buffer) ---
+    // This provides direct sunlight + CSM shadows even when the scene has no directional lights.
+    if (csmData.shadowParams.w >= 0.5) {
+        float3 sunDir  = normalize(csmData.sunDirection.xyz);
+        float  NdotL   = max(dot(N, sunDir), 0.0);
+        if (NdotL > 0.0) {
+            float shadow = sampleCSMShadow(input.WorldPos, ubo.view);
+            float3 H     = normalize(V + sunDir);
+            float NdotV  = max(dot(N, V), 0.0);
+            float NdotH  = max(dot(N, H), 0.0);
+            float HdotV  = max(dot(H, V), 0.0);
+            float D      = DistributionGGX(NdotH, roughness);
+            float G      = GeometrySmith(NdotV, NdotL, roughness);
+            float3 F     = FresnelSchlick(HdotV, F0);
+            float3 spec  = (D * G * F) / max(4.0 * NdotV * NdotL, 0.0001);
+            float3 kD    = (1.0 - F) * (1.0 - metallic);
+            float3 sunRadiance = csmData.sunColor.xyz * csmData.sunColor.w;
+            diffuseLighting  += (kD * albedo / PI) * sunRadiance * NdotL * shadow;
+            specularLighting += spec               * sunRadiance * NdotL * shadow;
+        }
+    }
+
+    // Multiscattering ambient IBL [MA19, La18]:
+    // Use analytical DFG approximation (Karis 2013) for energy compensation so
+    // specular energy lost due to roughness is not discarded.
+    float NdotV_amb = max(dot(N, V), 0.0);
+    float2 dfg      = EnvBRDFApprox(roughness, NdotV_amb);
+    float3 F_amb    = FresnelSchlickRoughness(NdotV_amb, F0, roughness);
+    float3 specAmbient = F_amb * dfg.x + dfg.y;   // energy-conserving specular ambient
+    float3 kD_amb   = (1.0 - F_amb) * (1.0 - metallic);
+
+    float ambientScale = 0.1 * ubo.scaleIBLAmbient * ao;
+    float3 ambient = (kD_amb * albedo + specAmbient) * ambientScale;
     float3 opaqueLit = diffuseLighting + specularLighting + ambient + emissive;
 
     // --- 4. Final Color Assembly (opaque only; transmission handled in GlassPSMain) ---

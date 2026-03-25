@@ -14,129 +14,91 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "camera_component.h"
+
+// ---------------------------------------------------------------------------
+// Scene-selection entry point.
+//
+// Usage:
+//   ./SimpleEngine                        -- shows ImGui picker at startup
+//   ./SimpleEngine --scene bistro         -- loads Bistro directly
+//   ./SimpleEngine --scene water          -- loads Water directly
+//   ./SimpleEngine --scene physics-hello  -- loads PhysX HelloWorld directly
+//
+// All scenes are registered via SceneFactory::RegisterAll().
+// ---------------------------------------------------------------------------
+
 #include "crash_reporter.h"
 #include "engine.h"
-#include "scene_loading.h"
-#include "transform_component.h"
+#include "renderer.h"
+#include "scene_factory.h"
+#include "water_system.h"
 
 #include <iostream>
 #include <stdexcept>
-#include <thread>
+#include <string>
 
+// ---------------------------------------------------------------------------
 // Constants
-constexpr int WINDOW_WIDTH  = 800;
-constexpr int WINDOW_HEIGHT = 600;
+// ---------------------------------------------------------------------------
+constexpr int  WINDOW_WIDTH            = 800;
+constexpr int  WINDOW_HEIGHT           = 600;
+constexpr bool ENABLE_VALIDATION_LAYERS =
 #if defined(NDEBUG)
-constexpr bool ENABLE_VALIDATION_LAYERS = false;
+    false;
 #else
-constexpr bool ENABLE_VALIDATION_LAYERS = true;
+    true;
 #endif
 
-/**
- * @brief Set up a simple scene with a camera and some objects.
- * @param engine The engine to set up the scene in.
- */
-void SetupScene(Engine *engine)
+// ---------------------------------------------------------------------------
+// Desktop entry point
+// ---------------------------------------------------------------------------
+#if !defined(PLATFORM_ANDROID)
+int main(int argc, char* argv[])
 {
-	// Create a camera entity
-	Entity *cameraEntity = engine->CreateEntity("Camera");
-	if (!cameraEntity)
-	{
-		throw std::runtime_error("Failed to create camera entity");
-	}
+    try {
+        CrashReporter::GetInstance().Initialize("crashes", "SimpleEngine", "1.0.0");
 
-	// Add a transform component to the camera
-	auto *cameraTransform = cameraEntity->AddComponent<TransformComponent>();
-	cameraTransform->SetPosition(glm::vec3(0.0f, 0.0f, 3.0f));
+        // Parse optional --scene <id> to skip the picker
+        std::string sceneArg;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--scene" && i + 1 < argc)
+                sceneArg = argv[++i];
+        }
 
-	// Add a camera component to the camera entity
-	auto *camera = cameraEntity->AddComponent<CameraComponent>();
-	camera->SetAspectRatio(static_cast<float>(WINDOW_WIDTH) / static_cast<float>(WINDOW_HEIGHT));
+        Engine engine;
+        if (!engine.Initialize("Simple Engine", WINDOW_WIDTH, WINDOW_HEIGHT,
+                               ENABLE_VALIDATION_LAYERS))
+            throw std::runtime_error("Failed to initialize engine");
 
-	// Set the camera as the active camera
-	engine->SetActiveCamera(camera);
+        SceneFactory& factory = SceneFactory::Instance();
+        factory.RegisterAll();
 
-	// Kick off GLTF model loading on a background thread so the main loop
-	// can start and render the UI/progress bar while the scene is being
-	// constructed. Engine::Update will avoid updating entities while
-	// loading is in progress to prevent data races.
-	if (auto *renderer = engine->GetRenderer())
-	{
-		renderer->SetLoading(true);
-		renderer->SetLoadingPhase(Renderer::LoadingPhase::Textures);
-	}
-	std::thread([engine] {
-		LoadGLTFModel(engine, "../Assets/bistro/bistro.gltf");
-	}).detach();
+        if (!sceneArg.empty()) {
+            if (!factory.Load(sceneArg, &engine))
+                throw std::runtime_error("Unknown scene: " + sceneArg);
+            engine.SetSceneLoaded(true);
+        } else {
+            factory.InstallPicker(&engine);
+        }
+
+        engine.Run();
+
+        // Clean up water system if it was active
+        if (auto* renderer = engine.GetRenderer()) {
+            if (renderer->waterSystem) {
+                renderer->waterSystem->Cleanup();
+                delete renderer->waterSystem;
+                renderer->waterSystem = nullptr;
+            }
+        }
+
+        CrashReporter::GetInstance().Cleanup();
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Exception: " << e.what() << '\n';
+        CrashReporter::GetInstance().Cleanup();
+        return 1;
+    }
 }
-
-#if defined(PLATFORM_ANDROID)
-/**
- * @brief Android entry point.
- * @param app The Android app.
- */
-void android_main(android_app *app)
-{
-	try
-	{
-		// Create the engine
-		Engine engine;
-
-		// Initialize the engine
-		if (!engine.InitializeAndroid(app, "Simple Engine", ENABLE_VALIDATION_LAYERS))
-		{
-			throw std::runtime_error("Failed to initialize engine");
-		}
-
-		// Set up the scene
-		SetupScene(&engine);
-
-		// Run the engine
-		engine.RunAndroid();
-	}
-	catch (const std::exception &e)
-	{
-		LOGE("Exception: %s", e.what());
-	}
-}
-#else
-/**
- * @brief Desktop entry point.
- * @return The exit code.
- */
-int main(int, char *[])
-{
-	try
-	{
-		// Enable minidump generation for Release-only crashes (e.g., stack cookie failures / fast-fail).
-		// Writes dumps under the current working directory (the build/run directory).
-		CrashReporter::GetInstance().Initialize("crashes", "SimpleEngine", "1.0.0");
-
-		// Create the engine
-		Engine engine;
-
-		// Initialize the engine
-		if (!engine.Initialize("Simple Engine", WINDOW_WIDTH, WINDOW_HEIGHT, ENABLE_VALIDATION_LAYERS))
-		{
-			throw std::runtime_error("Failed to initialize engine");
-		}
-
-		// Set up the scene
-		SetupScene(&engine);
-
-		// Run the engine
-		engine.Run();
-
-		CrashReporter::GetInstance().Cleanup();
-
-		return 0;
-	}
-	catch (const std::exception &e)
-	{
-		std::cerr << "Exception: " << e.what() << std::endl;
-		CrashReporter::GetInstance().Cleanup();
-		return 1;
-	}
-}
-#endif
+#endif // !PLATFORM_ANDROID

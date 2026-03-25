@@ -37,9 +37,11 @@
 #include <vulkan/vulkan_hpp_macros.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
+#define VMA_VULKAN_VERSION 1002000
+#include "vk_mem_alloc.h"
+
 #include "camera_component.h"
 #include "entity.h"
-#include "memory_pool.h"
 #include "mesh_component.h"
 #include "model_loader.h"
 #include "platform.h"
@@ -58,6 +60,7 @@
 
 // Forward declarations
 class ImGuiSystem;
+class WaterSystem;
 
 /**
  * @brief Structure for Vulkan queue family indices.
@@ -240,6 +243,29 @@ enum class RenderMode {
   RayQuery // Ray query compute shader
 };
 
+// CSM constants
+static constexpr uint32_t CSM_CASCADE_COUNT = 3;
+static constexpr uint32_t CSM_RESOLUTION    = 1024;
+
+struct CsmUBO {
+    alignas(16) glm::mat4 lightSpaceMatrices[CSM_CASCADE_COUNT];
+    alignas(16) glm::vec4 cascadeSplits;    // x/y/z = view-space far splits per cascade
+    alignas(16) glm::vec4 shadowParams;     // x=bias, y=slopeScale, z=unused, w=enable(1/0)
+    alignas(16) glm::vec4 sunDirection;     // xyz = normalized sun direction, w = unused
+    alignas(16) glm::vec4 sunColor;         // xyz = color, w = intensity
+};
+
+struct SkyPushConstants {
+    glm::mat4 invViewProj;
+    glm::vec3 sunDirection;
+    float     turbidity;
+    glm::vec3 groundColor;
+    float     sunIntensity;
+    float     sunDiscAngle;  // cos of half-angle
+    uint32_t  useEnvMap;     // 1 = sample env cubemap, 0 = Preetham procedural
+    float     _pad[2];
+};
+
 /**
  * @brief Class for managing Vulkan rendering.
  *
@@ -389,6 +415,60 @@ class Renderer {
       return queueFamilyIndices.graphicsFamily.value();
     }
 
+    /** @brief Get the graphics queue (for water system texture uploads). */
+    vk::Queue GetGraphicsQueue() const {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      return *graphicsQueue;
+    }
+
+    /** @brief Get the graphics queue family index. */
+    uint32_t GetGraphicsQueueFamilyIndex() const {
+      return queueFamilyIndices.graphicsFamily.value();
+    }
+
+    /** @brief Get the physical device (for memory type queries). */
+    vk::PhysicalDevice GetPhysicalDevice() const {
+      return *physicalDevice;
+    }
+
+    /** @brief Water descriptor set layout (created by createWaterPipeline). */
+    vk::DescriptorSetLayout GetWaterDescriptorSetLayout() const {
+      return *waterDescriptorSetLayout;
+    }
+
+    /** @brief Water pipeline layout. */
+    vk::PipelineLayout GetWaterPipelineLayout() const {
+      return *waterPipelineLayout;
+    }
+
+    /** @brief Water pipeline. */
+    vk::Pipeline GetWaterPipeline() const {
+      return *waterPipeline;
+    }
+
+    /** @brief Sun direction used by sky/CSM passes (for water lighting). */
+    glm::vec3 GetSunDirection() const { return sunDirection; }
+    /** @brief Atmospheric turbidity used by the Preetham sky model. */
+    float GetSunTurbidity() const { return sunTurbidity; }
+
+    /** @brief Whether an HDR environment texture has been loaded. */
+    bool HasEnvTexture() const { return hasEnvTexture; }
+    /** @brief Toggle between HDR env map and procedural Preetham sky. */
+    bool GetUseEnvMapForSky() const { return useEnvMapForSky; }
+    void SetUseEnvMapForSky(bool v) { useEnvMapForSky = v; }
+    /** @brief Load an EXR or HDR equirectangular environment map. */
+    bool LoadEnvTexture(const std::string& path);
+    /** @brief Raw VkImageView of the env map (for water system descriptor writes). */
+    vk::ImageView GetEnvImageView() const { return hasEnvTexture ? static_cast<vk::ImageView>(*envImageView) : vk::ImageView{}; }
+    /** @brief Raw VkSampler of the env map. */
+    vk::Sampler GetEnvSampler() const { return hasEnvTexture ? static_cast<vk::Sampler>(*envSampler) : vk::Sampler{}; }
+
+    /**
+     * @brief Optional water system pointer. Set by main.cpp when using the
+     *  water scene. Renderer::Render() calls Update/Render on it each frame.
+     */
+    WaterSystem* waterSystem = nullptr;
+
     /**
 	 * @brief Submit a command buffer to the compute queue with proper dispatch loader preservation.
 	 * @param commandBuffer The command buffer to submit.
@@ -535,6 +615,10 @@ class Renderer {
     // Track which entities use a given texture ID so that descriptor sets
     // can be refreshed when textures finish streaming in.
     void RegisterTextureUser(const std::string& textureId, Entity* entity);
+
+    // Inspector support: read the cached PBR push-constants for an entity.
+    // Returns false if the entity has no GPU resources yet.
+    bool GetEntityMaterialProps(Entity* entity, MaterialProperties& out) const;
     void OnTextureUploaded(const std::string& textureId);
 
     // Global loading state (model/scene). Consider the scene "loading" while
@@ -896,6 +980,30 @@ class Renderer {
 
     vk::Format findDepthFormat();
 
+    // -----------------------------------------------------------------------
+    // Vulkan Profile capability check [Vulkan Profiles spec]
+    // Validates that the selected physical device meets the SimpleEngine
+    // baseline profile (defined in vulkan_profiles/SimpleEngine_baseline.json).
+    // Non-fatal: logs warnings but does not abort initialization.
+    // -----------------------------------------------------------------------
+    void checkAndLogVulkanProfile();
+
+    // -----------------------------------------------------------------------
+    // Debug label helpers — VK_EXT_debug_utils GPU markers.
+    // Visible in RenderDoc, Nsight, and any tool that reads debug labels.
+    // No-ops at runtime when the extension is not loaded.
+    // -----------------------------------------------------------------------
+    void BeginDebugLabel(vk::raii::CommandBuffer& cmd, const char* name,
+                         float r = 0.5f, float g = 0.5f, float b = 0.5f, float a = 1.0f);
+    void EndDebugLabel(vk::raii::CommandBuffer& cmd);
+    void InsertDebugLabel(vk::raii::CommandBuffer& cmd, const char* name,
+                          float r = 0.5f, float g = 0.5f, float b = 0.5f, float a = 1.0f);
+
+    // Object naming (shows in RenderDoc resource list)
+    void SetDebugName(vk::Buffer buffer, const char* name);
+    void SetDebugName(vk::Image  image,  const char* name);
+    void SetDebugName(vk::Pipeline pipeline, const char* name);
+
     /**
 	 * @brief Pre-allocate all Vulkan resources for an entity during scene loading.
 	 * @param entity The entity to pre-allocate resources for.
@@ -963,6 +1071,138 @@ class Renderer {
     // Wired through `UniformBufferObject.padding2` to avoid UBO layout churn.
     bool enableRasterRayQueryShadows = false;
 
+    // Sky
+    bool                      enableSky             = true;
+    glm::vec3                 sunDirection          = glm::normalize(glm::vec3(0.6f, 0.35f, 0.4f)); // ~20° elevation, visible from ocean
+    float                     sunTurbidity          = 3.0f;
+    float                     sunIntensity          = 1.5f;  // slightly brighter default
+    vk::raii::PipelineLayout  skyPipelineLayout{nullptr};
+    vk::raii::Pipeline        skyPipeline{nullptr};
+
+    // ---------------------------------------------------------------------------
+    // Dual-Kawase Bloom [Jimenez 2014]
+    // ---------------------------------------------------------------------------
+    static constexpr uint32_t BLOOM_MIP_COUNT = 5;   // number of half-res mips
+    float                     bloomThreshold  = 0.9f; // luminance brightpass knee
+    float                     bloomStrength   = 0.04f; // upsample additive weight
+    bool                      enableBloom     = true;
+
+    // HDR off-screen color target (R16G16B16A16_SFLOAT) – main scene is rendered here
+    // before bloom + composite.
+    vk::raii::Image           hdrColorImage{nullptr};
+    VmaAllocation             hdrColorImageAllocation = VK_NULL_HANDLE;
+    vk::raii::ImageView       hdrColorImageView{nullptr};
+    vk::ImageLayout           hdrColorImageLayout = vk::ImageLayout::eUndefined;
+
+    // Bloom mip chain: each level is half the resolution of the previous
+    struct BloomMip {
+        vk::raii::Image      image{nullptr};
+        VmaAllocation        allocation = VK_NULL_HANDLE;
+        vk::raii::ImageView  view{nullptr};
+        uint32_t             width  = 0;
+        uint32_t             height = 0;
+        vk::ImageLayout      layout = vk::ImageLayout::eUndefined;
+    };
+    std::array<BloomMip, BLOOM_MIP_COUNT> bloomMips;
+
+    // Bloom pipeline (downsample + upsample share layout, differ only in FS entry)
+    vk::raii::DescriptorSetLayout  bloomDescriptorSetLayout{nullptr};
+    vk::raii::PipelineLayout       bloomPipelineLayout{nullptr};
+    vk::raii::Pipeline             bloomDownsamplePipeline{nullptr};
+    vk::raii::Pipeline             bloomUpsamplePipeline{nullptr};
+    // Additive blend pipeline: renders bloomMips[0] into opaqueSceneColorImages (pre-composite)
+    vk::raii::Pipeline             bloomAddPipeline{nullptr};
+
+    // Per-mip descriptor sets: one for each downsample pass and one for each upsample pass
+    // Downsample[i] samples bloomMip[i-1] (or hdrColor for i=0)
+    // Upsample[i]   samples bloomMip[i+1] and adds into bloomMip[i]
+    vk::raii::DescriptorPool       bloomDescriptorPool{nullptr};
+    std::vector<vk::raii::DescriptorSet> bloomDownsampleSets; // BLOOM_MIP_COUNT sets
+    std::vector<vk::raii::DescriptorSet> bloomUpsampleSets;   // (BLOOM_MIP_COUNT-1) sets
+
+    // Sampler for bloom (linear clamp)
+    vk::raii::Sampler              bloomSampler{nullptr};
+
+    bool createBloomResources();
+    bool createBloomPipelines();
+
+    // ---------------------------------------------------------------------------
+    // Histogram Auto-Exposure [Chapelle 2018]
+    // ---------------------------------------------------------------------------
+    bool                            enableAutoExposure  = false; // off by default; use manual exposure until calibrated
+    float                           exposureMinLog      = -8.0f; // log2 lum floor (maps to bin 0)
+    float                           exposureMaxLog      =  4.0f; // log2 lum ceiling (bin 255)
+    float                           exposureTargetLum   =  0.18f;// 18% grey target
+    float                           exposureAdaptSpeed  =  1.5f; // EV100 eye adaptation per second
+    float                           exposureBaseEV      =  0.0f; // manual EV bias
+
+    // 256-bin log-lum histogram SSBO
+    vk::raii::Buffer                exposureHistogramBuffer{nullptr};
+    VmaAllocation                   exposureHistogramAlloc = VK_NULL_HANDLE;
+    // Single-float exposure multiplier SSBO (read each frame)
+    vk::raii::Buffer                exposureValueBuffer{nullptr};
+    VmaAllocation                   exposureValueAlloc    = VK_NULL_HANDLE;
+    void*                           exposureValueMapped   = nullptr; // persistent map for readback
+
+    vk::raii::DescriptorSetLayout   exposureDescriptorSetLayout{nullptr};
+    vk::raii::PipelineLayout        exposurePipelineLayout{nullptr};
+    vk::raii::Pipeline              exposureHistogramPipeline{nullptr};
+    vk::raii::Pipeline              exposureReducePipeline{nullptr};
+    vk::raii::DescriptorPool        exposureDescriptorPool{nullptr};
+    vk::raii::DescriptorSet         exposureDescriptorSet{nullptr};
+
+    bool createExposureResources();
+    bool createExposurePipelines();
+
+    // Environment / HDR cubemap (equirectangular)
+    vk::raii::Image           envImage{nullptr};
+    vk::raii::DeviceMemory    envMemory{nullptr};
+    vk::raii::ImageView       envImageView{nullptr};
+    vk::raii::Sampler         envSampler{nullptr};
+    bool                      hasEnvTexture    = false;
+    bool                      useEnvMapForSky  = false;  // user toggle: HDR map vs procedural
+
+    // Sky descriptor set (binding 0 = env map sampler)
+    vk::raii::DescriptorSetLayout skyDescriptorSetLayout{nullptr};
+    vk::raii::DescriptorPool      skyDescriptorPool{nullptr};
+    vk::raii::DescriptorSet       skyDescriptorSet{nullptr};
+
+    // Water
+    vk::raii::DescriptorSetLayout waterDescriptorSetLayout{nullptr};
+    vk::raii::PipelineLayout      waterPipelineLayout{nullptr};
+    vk::raii::Pipeline            waterPipeline{nullptr};
+
+    // CSM
+    bool                      enableCSM             = true;
+    float                     csmDepthBiasConst     = 1.5f;
+    float                     csmDepthBiasSlope     = 1.75f;
+
+    struct CsmPerFrame {
+        std::array<vk::raii::Image,     CSM_CASCADE_COUNT> images{nullptr, nullptr, nullptr};
+        std::array<vk::raii::DeviceMemory, CSM_CASCADE_COUNT> memories{nullptr, nullptr, nullptr};
+        std::array<vk::raii::ImageView, CSM_CASCADE_COUNT> views{nullptr, nullptr, nullptr};
+        vk::raii::Sampler               shadowSampler{nullptr};
+        vk::raii::Buffer                uboBuffer{nullptr};
+        vk::raii::DeviceMemory          uboMemory{nullptr};
+        void*                           uboMapped = nullptr;
+        vk::raii::DescriptorPool        descriptorPool{nullptr};
+        vk::raii::DescriptorSet         descriptorSet{nullptr};
+        std::array<vk::ImageLayout, CSM_CASCADE_COUNT> layouts{
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eUndefined};
+    };
+    std::vector<CsmPerFrame>         csmFrames;
+    vk::raii::DescriptorSetLayout    csmDepthDescriptorSetLayout{nullptr};
+    vk::raii::PipelineLayout         csmDepthPipelineLayout{nullptr};
+    vk::raii::Pipeline               csmDepthPipeline{nullptr};
+
+    struct CascadeInfo {
+        glm::mat4 lightSpaceMatrix;
+        float     splitFarVS;
+    };
+    std::array<CascadeInfo, CSM_CASCADE_COUNT> computedCascades;
+
     // Ray Query tuning
     int rayQueryMaxBounces = 1; // 0 = no secondary rays, 1 = one-bounce reflection/refraction
     bool enableRayQueryShadows = true; // Hard shadows for Ray Query direct lighting (shadow rays)
@@ -984,8 +1224,8 @@ class Renderer {
     vk::raii::PhysicalDevice physicalDevice = nullptr;
     vk::raii::Device device = nullptr;
 
-    // Memory pool for efficient memory management
-    std::unique_ptr<MemoryPool> memoryPool;
+    // VMA allocator for memory management
+    VmaAllocator vmaAllocator = VK_NULL_HANDLE;
 
     // Vulkan queues
     vk::raii::Queue graphicsQueue = nullptr;
@@ -1081,7 +1321,7 @@ class Renderer {
 
     // Depth buffer
     vk::raii::Image depthImage = nullptr;
-    std::unique_ptr<MemoryPool::Allocation> depthImageAllocation = nullptr;
+    VmaAllocation depthImageAllocation = VK_NULL_HANDLE;
     vk::raii::ImageView depthImageView = nullptr;
 
     // Forward+ configuration
@@ -1101,27 +1341,27 @@ class Renderer {
     struct ForwardPlusPerFrame {
       // SSBOs for per-tile light lists
       vk::raii::Buffer tileHeaders = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> tileHeadersAlloc = nullptr;
+      VmaAllocation tileHeadersAlloc = VK_NULL_HANDLE;
       vk::raii::Buffer tileLightIndices = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> tileLightIndicesAlloc = nullptr;
+      VmaAllocation tileLightIndicesAlloc = VK_NULL_HANDLE;
       size_t tilesCapacity = 0; // number of tiles allocated
       size_t indicesCapacity = 0; // number of indices allocated
 
       // Uniform buffer with view/proj, screen size, tile size, etc.
       vk::raii::Buffer params = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> paramsAlloc = nullptr;
+      VmaAllocation paramsAlloc = VK_NULL_HANDLE;
       void* paramsMapped = nullptr;
 
       // Optional compute debug output buffer (uints), host-visible
       vk::raii::Buffer debugOut = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> debugOutAlloc = nullptr;
+      VmaAllocation debugOutAlloc = VK_NULL_HANDLE;
       bool debugOutAwaitingReadback = false;
 
       // One-frame color probes (host-visible, small buffers)
       vk::raii::Buffer probeOffscreen = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> probeOffscreenAlloc = nullptr;
+      VmaAllocation probeOffscreenAlloc = VK_NULL_HANDLE;
       vk::raii::Buffer probeSwapchain = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> probeSwapchainAlloc = nullptr;
+      VmaAllocation probeSwapchainAlloc = VK_NULL_HANDLE;
       bool probeAwaitingReadback = false;
 
       // Compute descriptor set for culling
@@ -1155,18 +1395,18 @@ class Renderer {
 
     // Dedicated ray query UBO (one per frame in flight) - separate from entity UBOs
     std::vector<vk::raii::Buffer> rayQueryUniformBuffers;
-    std::vector<std::unique_ptr<MemoryPool::Allocation>> rayQueryUniformAllocations;
+    std::vector<VmaAllocation> rayQueryUniformAllocations;
     std::vector<void *> rayQueryUniformBuffersMapped;
 
     // Ray query output image (storage image for compute shader output)
     vk::raii::Image rayQueryOutputImage = nullptr;
-    std::unique_ptr<MemoryPool::Allocation> rayQueryOutputImageAllocation = nullptr;
+    VmaAllocation rayQueryOutputImageAllocation = VK_NULL_HANDLE;
     vk::raii::ImageView rayQueryOutputImageView = nullptr;
 
     // Acceleration structures for ray query
     struct AccelerationStructure {
       vk::raii::Buffer buffer = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> allocation = nullptr;
+      VmaAllocation allocation = VK_NULL_HANDLE;
       vk::raii::AccelerationStructureKHR handle = nullptr; // Use RAII for proper lifetime management
       vk::DeviceAddress deviceAddress = 0;
     };
@@ -1245,9 +1485,9 @@ class Renderer {
 
     // Ray query geometry and material buffers
     vk::raii::Buffer geometryInfoBuffer = nullptr;
-    std::unique_ptr<MemoryPool::Allocation> geometryInfoAllocation = nullptr;
+    VmaAllocation geometryInfoAllocation = VK_NULL_HANDLE;
     vk::raii::Buffer materialBuffer = nullptr;
-    std::unique_ptr<MemoryPool::Allocation> materialAllocation = nullptr;
+    VmaAllocation materialAllocation = VK_NULL_HANDLE;
 
     // Ray query baseColor texture array (binding 6)
     static constexpr uint32_t RQ_MAX_TEX = 2048;
@@ -1318,7 +1558,7 @@ class Renderer {
     // The texture that will hold a snapshot of the opaque scene
     // One off-screen color image per frame-in-flight to avoid cross-frame read/write hazards.
     std::vector<vk::raii::Image> opaqueSceneColorImages;
-    std::vector<std::unique_ptr<MemoryPool::Allocation>> opaqueSceneColorImageAllocations;
+    std::vector<VmaAllocation> opaqueSceneColorImageAllocations;
     std::vector<vk::raii::ImageView> opaqueSceneColorImageViews;
     // Track the current layout per frame (initialized to eUndefined at creation)
     std::vector<vk::ImageLayout> opaqueSceneColorImageLayouts;
@@ -1338,9 +1578,9 @@ class Renderer {
     struct MeshResources {
       // Device-local vertex/index buffers used for rendering
       vk::raii::Buffer vertexBuffer = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> vertexBufferAllocation = nullptr;
+      VmaAllocation vertexBufferAllocation = VK_NULL_HANDLE;
       vk::raii::Buffer indexBuffer = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> indexBufferAllocation = nullptr;
+      VmaAllocation indexBufferAllocation = VK_NULL_HANDLE;
       uint32_t indexCount = 0;
 
       // Optional per-mesh staging buffers used when uploads are batched.
@@ -1361,8 +1601,8 @@ class Renderer {
 
     // Texture resources
     struct TextureResources {
-      vk::raii::Image textureImage = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> textureImageAllocation = nullptr;
+      vk::raii::Image textureImage{nullptr};
+      VmaAllocation textureImageAllocation = VK_NULL_HANDLE;
       vk::raii::ImageView textureImageView = nullptr;
       vk::raii::Sampler textureSampler = nullptr;
       vk::Format format = vk::Format::eR8G8B8A8Srgb; // Store texture format for proper color space handling
@@ -1405,8 +1645,10 @@ class Renderer {
     // on the GPU side. Used only for UI feedback during streaming.
     std::atomic<uint32_t> uploadJobsTotal{0};
     std::atomic<uint32_t> uploadJobsCompleted{0};
-    // When true, initial scene load is complete and the loading overlay should be hidden
-    std::atomic<bool> initialLoadComplete{false};
+    // When true, initial scene load is complete and the loading overlay should be hidden.
+    // Starts true so that IsLoading() returns false before any scene is selected.
+    // SetLoading(true) resets this to false when a real load begins.
+    std::atomic<bool> initialLoadComplete{true};
     // Loading-phase UI state (atomic because ImGui may query at any point)
     std::atomic<uint32_t> loadingPhase{static_cast<uint32_t>(LoadingPhase::Scene)};
     std::atomic<float> loadingPhaseProgress{0.0f};
@@ -1476,7 +1718,7 @@ class Renderer {
     // Dynamic lighting system using storage buffers
     struct LightStorageBuffer {
       vk::raii::Buffer buffer = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> allocation = nullptr;
+      VmaAllocation allocation = VK_NULL_HANDLE;
       void* mapped = nullptr;
       size_t capacity = 0; // Current capacity in number of lights
       size_t size = 0; // Current number of lights
@@ -1486,14 +1728,14 @@ class Renderer {
     // Entity resources (contains descriptor sets - must be declared before descriptor pool)
     struct EntityResources {
       std::vector<vk::raii::Buffer> uniformBuffers;
-      std::vector<std::unique_ptr<MemoryPool::Allocation>> uniformBufferAllocations;
+      std::vector<VmaAllocation> uniformBufferAllocations;
       std::vector<void *> uniformBuffersMapped;
       std::vector<vk::raii::DescriptorSet> basicDescriptorSets; // For basic pipeline
       std::vector<vk::raii::DescriptorSet> pbrDescriptorSets; // For PBR pipeline
 
       // Instance buffer for instanced rendering
       vk::raii::Buffer instanceBuffer = nullptr;
-      std::unique_ptr<MemoryPool::Allocation> instanceBufferAllocation = nullptr;
+      VmaAllocation instanceBufferAllocation = VK_NULL_HANDLE;
       void* instanceBufferMapped = nullptr;
 
       // Tracks whether binding 0 (UBO) has been written at least once for each frame
@@ -1644,13 +1886,14 @@ class Renderer {
       bool instanced{false}; // true when this TLAS entry comes from MeshComponent instancing
     };
     vk::raii::Buffer tlasInstancesBuffer{nullptr};
-    std::unique_ptr<MemoryPool::Allocation> tlasInstancesAllocation;
+    VmaAllocation tlasInstancesAllocation = VK_NULL_HANDLE;
     uint32_t tlasInstanceCount = 0;
     std::vector<TlasInstanceRef> tlasInstanceOrder; // order must match buffer instances
 
     // Scratch buffer for TLAS UPDATE operations
     vk::raii::Buffer tlasUpdateScratchBuffer{nullptr};
-    std::unique_ptr<MemoryPool::Allocation> tlasUpdateScratchAllocation;
+    VmaAllocation tlasUpdateScratchAllocation = VK_NULL_HANDLE;
+    vk::DeviceSize tlasUpdateScratchSize = 0; // track size for resize check
 
     // Maximum number of frames in flight
     // More than 1 allows CPU/GPU overlap and reduce per-frame stalls.
@@ -1716,12 +1959,12 @@ class Renderer {
 
     struct ReflectionRT {
       vk::raii::Image color{nullptr};
-      std::unique_ptr<MemoryPool::Allocation> colorAlloc{nullptr};
+      VmaAllocation colorAlloc = VK_NULL_HANDLE;
       vk::raii::ImageView colorView{nullptr};
       vk::raii::Sampler colorSampler{nullptr};
 
       vk::raii::Image depth{nullptr};
-      std::unique_ptr<MemoryPool::Allocation> depthAlloc{nullptr};
+      VmaAllocation depthAlloc = VK_NULL_HANDLE;
       vk::raii::ImageView depthView{nullptr};
 
       uint32_t width{0};
@@ -1797,6 +2040,19 @@ class Renderer {
 	bool createCommandBuffers();
 	bool createSyncObjects();
 
+    // Sky, CSM, and Water methods
+    bool createSkyPipeline();
+    bool createWaterPipeline();
+    bool createCSMResources();
+    void destroyCSMResources();
+    bool createCSMDepthPipeline();
+    void computeCascadeMatrices(CameraComponent* camera);
+    void renderCSMPasses(vk::raii::CommandBuffer& cmd, CameraComponent* camera,
+                         const std::vector<Entity*>& entities);
+    void renderSkyPass(vk::raii::CommandBuffer& cmd, CameraComponent* camera);
+    void uploadCSMUBO(uint32_t frameIndex);
+    void updateCSMDescriptorSetsGlobal(uint32_t frameIndex);
+
     void cleanupSwapChain();
 
     // Planar reflection helpers (initial scaffolding)
@@ -1856,11 +2112,11 @@ class Renderer {
     bool createOpaqueSceneColorResources();
     void createTransparentDescriptorSets();
     void createTransparentFallbackDescriptorSets();
-    std::pair<vk::raii::Buffer, std::unique_ptr<MemoryPool::Allocation>> createBufferPooled(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties);
+    std::pair<vk::raii::Buffer, VmaAllocation> createVmaBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, VmaMemoryUsage memUsage, VmaAllocationCreateFlags allocFlags = 0);
     void copyBuffer(vk::raii::Buffer& srcBuffer, vk::raii::Buffer& dstBuffer, vk::DeviceSize size);
 
     std::pair<vk::raii::Image, vk::raii::DeviceMemory> createImage(uint32_t width, uint32_t height, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties);
-    std::pair<vk::raii::Image, std::unique_ptr<MemoryPool::Allocation>> createImagePooled(uint32_t width, uint32_t height, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties, uint32_t mipLevels = 1, vk::SharingMode sharingMode = vk::SharingMode::eExclusive, const std::vector<uint32_t>& queueFamilies = {});
+    std::pair<vk::raii::Image, VmaAllocation> createVmaImage(uint32_t width, uint32_t height, vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, VmaMemoryUsage memUsage, uint32_t mipLevels = 1, vk::SharingMode sharingMode = vk::SharingMode::eExclusive, const std::vector<uint32_t>& queueFamilyIndices = {});
     void transitionImageLayout(vk::Image image, vk::Format format, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels = 1);
     void copyBufferToImage(vk::Buffer buffer, vk::Image image, uint32_t width, uint32_t height, vk::ArrayProxy<const vk::BufferImageCopy> regions);
     // Extended: track stagedBytes for perf stats

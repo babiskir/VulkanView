@@ -301,7 +301,7 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
     // Keep scratch buffers alive until GPU execution completes (after fence wait)
     // Destroying them early causes "VkBuffer was destroy" validation errors and crashes
     std::vector<vk::raii::Buffer> scratchBuffers;
-    std::vector<std::unique_ptr<MemoryPool::Allocation>> scratchAllocations;
+    std::vector<VmaAllocation> scratchAllocations;
 
     for (size_t i = 0; i < uniqueMeshes.size(); ++i) {
       kickWatchdog();
@@ -362,10 +362,10 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
         primitiveCount);
 
       // Create BLAS buffer
-      auto [blasBuffer, blasAlloc] = createBufferPooled(
+      auto [blasBuffer, blasAlloc] = createVmaBuffer(
         sizeInfo.accelerationStructureSize,
         vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
+        VMA_MEMORY_USAGE_GPU_ONLY);
 
       // Create acceleration structure
       vk::AccelerationStructureCreateInfoKHR createInfo{};
@@ -376,10 +376,10 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
       vk::raii::AccelerationStructureKHR blasHandle(device, createInfo);
 
       // Create scratch buffer
-      auto [scratchBuffer, scratchAlloc] = createBufferPooled(
+      auto [scratchBuffer, scratchAlloc] = createVmaBuffer(
         sizeInfo.buildScratchSize,
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
+        VMA_MEMORY_USAGE_GPU_ONLY);
 
       vk::DeviceAddress scratchAddress = getBufferDeviceAddress(device, *scratchBuffer);
 
@@ -409,7 +409,7 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
       // Store BLAS (move RAII handle to avoid copy)
       blasStructures[i].buffer = std::move(blasBuffer);
-      blasStructures[i].allocation = std::move(blasAlloc);
+      blasStructures[i].allocation = blasAlloc;
       blasStructures[i].handle = std::move(blasHandle);
       blasStructures[i].deviceAddress = blasAddress;
 
@@ -764,22 +764,27 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
     // Create instances buffer (persistent for TLAS UPDATE/Refit)
     vk::DeviceSize instancesSize = sizeof(vk::AccelerationStructureInstanceKHR) * instances.size();
-    auto [instancesBufferTmp, instancesAllocTmp] = createBufferPooled(
+    auto [instancesBufferTmp, instancesAllocTmp] = createVmaBuffer(
       instancesSize,
       vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+      VMA_MEMORY_USAGE_CPU_TO_GPU,
+      VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-    // Upload instances - use mappedPtr directly
-    void* instancesData = instancesAllocTmp->mappedPtr;
-    if (!instancesData) {
-      std::cerr << "Failed to get mapped pointer for instances buffer\n";
-      return false;
+    // Upload instances - use mapped pointer via vmaGetAllocationInfo
+    {
+      VmaAllocationInfo instInfo{};
+      vmaGetAllocationInfo(vmaAllocator, instancesAllocTmp, &instInfo);
+      void* instancesData = instInfo.pMappedData;
+      if (!instancesData) {
+        std::cerr << "Failed to get mapped pointer for instances buffer\n";
+        return false;
+      }
+      memcpy(instancesData, instances.data(), instancesSize);
     }
-    memcpy(instancesData, instances.data(), instancesSize);
 
     // Persist instances buffer/allocation and order for UPDATE (refit)
     tlasInstancesBuffer = std::move(instancesBufferTmp);
-    tlasInstancesAllocation = std::move(instancesAllocTmp);
+    tlasInstancesAllocation = instancesAllocTmp;
     tlasInstanceCount = static_cast<uint32_t>(instances.size());
     // tlasInstanceOrder already filled above in the same order as 'instances'
 
@@ -816,10 +821,10 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
       instanceCount);
 
     // Create TLAS buffer
-    auto [tlasBuffer, tlasAlloc] = createBufferPooled(
+    auto [tlasBuffer, tlasAlloc] = createVmaBuffer(
       tlasSizeInfo.accelerationStructureSize,
       vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      VMA_MEMORY_USAGE_GPU_ONLY);
 
     // Create TLAS
     vk::AccelerationStructureCreateInfoKHR tlasCreateInfo{};
@@ -830,10 +835,10 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
     vk::raii::AccelerationStructureKHR tlasHandle(device, tlasCreateInfo);
 
     // Create TLAS scratch buffer (for initial build)
-    auto [tlasScratchBuffer, tlasScratchAlloc] = createBufferPooled(
+    auto [tlasScratchBuffer, tlasScratchAlloc] = createVmaBuffer(
       tlasSizeInfo.buildScratchSize,
       vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-      vk::MemoryPropertyFlagBits::eDeviceLocal);
+      VMA_MEMORY_USAGE_GPU_ONLY);
 
     vk::DeviceAddress tlasScratchAddress = getBufferDeviceAddress(device, *tlasScratchBuffer);
 
@@ -847,13 +852,15 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
     // Ensure/update a persistent scratch buffer for TLAS UPDATE (refit)
     // Allocate once sized to updateScratchSize; recreate if needed for larger scenes
-    if (!*tlasUpdateScratchBuffer || !tlasUpdateScratchAllocation || tlasUpdateScratchAllocation->size < tlasSizeInfo.updateScratchSize) {
-      auto [updBuf, updAlloc] = createBufferPooled(
+    if (!*tlasUpdateScratchBuffer || !tlasUpdateScratchAllocation || tlasUpdateScratchSize < tlasSizeInfo.updateScratchSize) {
+      if (tlasUpdateScratchAllocation) { vmaFreeMemory(vmaAllocator, tlasUpdateScratchAllocation); tlasUpdateScratchAllocation = VK_NULL_HANDLE; }
+      auto [updBuf, updAlloc] = createVmaBuffer(
         tlasSizeInfo.updateScratchSize,
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
+        VMA_MEMORY_USAGE_GPU_ONLY);
       tlasUpdateScratchBuffer = std::move(updBuf);
-      tlasUpdateScratchAllocation = std::move(updAlloc);
+      tlasUpdateScratchAllocation = updAlloc;
+      tlasUpdateScratchSize = tlasSizeInfo.updateScratchSize;
     }
 
     // TLAS build range
@@ -874,7 +881,7 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
     // Store TLAS (move RAII handle to avoid copy)
     tlasStructure.buffer = std::move(tlasBuffer);
-    tlasStructure.allocation = std::move(tlasAlloc);
+    tlasStructure.allocation = tlasAlloc;
     tlasStructure.handle = std::move(tlasHandle);
     tlasStructure.deviceAddress = tlasAddress;
 
@@ -892,6 +899,10 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
     // Wait with periodic watchdog kicks to avoid false hang detection on large scenes.
     (void) waitForFencesSafe(*fence, VK_TRUE);
+    // Free scratch buffers/allocations now that GPU work is done
+    scratchBuffers.clear(); // RAII destroy vkDestroyBuffer first
+    for (auto sa : scratchAllocations) { if (sa) vmaFreeMemory(vmaAllocator, sa); }
+    scratchAllocations.clear();
     // TLAS build completed on GPU
     setASUi(true,
             "AS: upload buffers",
@@ -913,18 +924,21 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
     // Create and upload geometry info buffer
     if (!geometryInfos.empty()) {
       vk::DeviceSize geoInfoSize = sizeof(GeometryInfo) * geometryInfos.size();
-      auto [geoInfoBuf, geoInfoAlloc] = createBufferPooled(
+      auto [geoInfoBuf, geoInfoAlloc] = createVmaBuffer(
         geoInfoSize,
         vk::BufferUsageFlagBits::eStorageBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-      void* geoInfoData = geoInfoAlloc->mappedPtr;
-      if (geoInfoData) {
-        memcpy(geoInfoData, geometryInfos.data(), geoInfoSize);
+      {
+        VmaAllocationInfo geoInfo{};
+        vmaGetAllocationInfo(vmaAllocator, geoInfoAlloc, &geoInfo);
+        if (geoInfo.pMappedData)
+          memcpy(geoInfo.pMappedData, geometryInfos.data(), geoInfoSize);
       }
 
       geometryInfoBuffer = std::move(geoInfoBuf);
-      geometryInfoAllocation = std::move(geoInfoAlloc);
+      geometryInfoAllocation = geoInfoAlloc;
       geometryInfoCountCPU = geometryInfos.size();
 
       // (Verbose geometry info buffer stats removed.)
@@ -1223,18 +1237,21 @@ bool Renderer::buildAccelerationStructures(const std::vector<Entity *>& entities
 
       // Create and upload material buffer (always create, even if no materials found)
       vk::DeviceSize matSize = sizeof(MaterialData) * materials.size();
-      auto [matBuf, matAlloc] = createBufferPooled(
+      auto [matBuf, matAlloc] = createVmaBuffer(
         matSize,
         vk::BufferUsageFlagBits::eStorageBuffer,
-        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+        VMA_MEMORY_USAGE_CPU_TO_GPU,
+        VMA_ALLOCATION_CREATE_MAPPED_BIT);
 
-      void* matData = matAlloc->mappedPtr;
-      if (matData) {
-        memcpy(matData, materials.data(), matSize);
+      {
+        VmaAllocationInfo matInfo{};
+        vmaGetAllocationInfo(vmaAllocator, matAlloc, &matInfo);
+        if (matInfo.pMappedData)
+          memcpy(matInfo.pMappedData, materials.data(), matSize);
       }
 
       materialBuffer = std::move(matBuf);
-      materialAllocation = std::move(matAlloc);
+      materialAllocation = matAlloc;
 
       // (Verbose material buffer stats removed.)
 
@@ -1280,7 +1297,9 @@ bool Renderer::refitTopLevelAS(const std::vector<Entity *>& entities, CameraComp
       return false;
 
     // Update instance transforms in the persistent instances buffer
-    auto* instPtr = reinterpret_cast<vk::AccelerationStructureInstanceKHR *>(tlasInstancesAllocation->mappedPtr);
+    VmaAllocationInfo instRefit{};
+    vmaGetAllocationInfo(vmaAllocator, tlasInstancesAllocation, &instRefit);
+    auto* instPtr = reinterpret_cast<vk::AccelerationStructureInstanceKHR *>(instRefit.pMappedData);
     if (!instPtr)
       return false;
 
